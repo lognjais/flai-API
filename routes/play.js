@@ -1,63 +1,41 @@
 const http = require('http');
 const https = require('https');
-const request = require('request');
 
-const handlePlay = (req, res, db) => {
+const handlePlay = async (req, res, db) => {
+    try {
+        const fetchedLink = req.params.id;
+        if (!fetchedLink || fetchedLink.length < 10) {
+            return res.redirect('https://flai.ml');
+        }
 
-	let fetchedLink = req.params.id;
+        const data = await db.collection('flai').findOne({ link: fetchedLink }, { projection: { url: 1 } });
+        
+        if (data && data.url) {
+            const targetUrl = data.url;
+            const client = targetUrl.startsWith('https') ? https : http;
 
-	if(fetchedLink.length < 10) res.redirect('https://flai.ml');
+            client.get(targetUrl, (response) => {
+                if ([301, 302, 303, 307, 308].includes(response.statusCode) && response.headers.location) {
+                    const redirectUrl = response.headers.location;
+                    const redirectClient = redirectUrl.startsWith('https') ? https : http;
+                    redirectClient.get(redirectUrl, (redirectResp) => {
+                        res.writeHead(200, { 'Content-Type': redirectResp.headers['content-type'] || 'application/octet-stream' });
+                        redirectResp.pipe(res);
+                    }).on('error', () => res.redirect('https://jvoltci.github.io/flai/#/error'));
+                } else {
+                    res.writeHead(200, { 'Content-Type': response.headers['content-type'] || 'application/octet-stream' });
+                    response.pipe(res);
+                }
+            }).on('error', () => {
+                res.redirect('https://jvoltci.github.io/flai/#/error');
+            });
+        } else {
+            return res.redirect('https://flai.ml');
+        }
+    } catch (err) {
+        console.error('[play] Error:', err);
+        return res.status(500).send('Internal Error');
+    }
+};
 
-	db.collection('flai').find({ link: fetchedLink }).project({ link: 1 }).toArray()
-		.then(data => {
-			if(data[0]) {
-				url = data[0].url;
-				return '';
-			}
-			else
-				return url = '';
-		})
-		.then(() => {
-			if(url) {
-				request.head({ url: url, followRedirect: false}, (err, resE) => {
-	                if(resE.headers.location)
-	                    url = resE.headers.location;
-
-	                if(url[4] !== 's') {
-						try {
-							const request = http.get(url, (response) => {
-								res.writeHead(200, {
-									'Content-Type': response.headers['content-type']
-								});
-								response.pipe(res);
-							});
-						}
-						catch(error) {
-							res.redirect('https://jvoltci.github.io/flai/#/error');
-						}
-					}
-					else {
-						try {
-							const request = https.get(url, (response) => {
-								res.writeHead(200, {
-									'Content-Type': response.headers['content-type']
-								});
-								response.pipe(res);
-							});
-						}
-						catch(error) {
-							res.redirect('https://jvoltci.github.io/flai/#/error');
-						}
-					}
-	            })
-			}
-			else {
-				res.redirect('https://flai.ml');
-			}
-		})
-		.catch(err => res.send(err))
-}
-
-module.exports = {
-	handlePlay: handlePlay
-}
+module.exports = { handlePlay };

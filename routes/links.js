@@ -1,60 +1,38 @@
 const http = require('http');
 const https = require('https');
-const request = require('request');
- 
-//const { setFileName } = require('./lib/setFileName');
- 
-const handleLinks = (req, res, db) => {
- 
-    let fetchedLink = req.params.id;
-    if(fetchedLink.length < 10) res.redirect('https://jvoltci.github.io/flai');
-    db.collection('flai').find({ link: fetchedLink }).project({ link: 1 }).toArray()
-    .then(data => {
-        if(data[0]) {
-            url = data[0].url;
-            return '';
-        }
-        else
-            return url = '';
-    })
-    .then(() => {
-        if(url) {
-            request.head({ url: url, followRedirect: false}, (err, resE) => {
-                if(resE.headers.location)
-                    url = resE.headers.location;
 
-                let cd = '';
-                if(url[4] !== 's') {
-                    try {
-                        const request = http.get(url, (response) => {
-                            response.pipe(res);
-                        });
-                    }
-                    catch(error) {
-                        res.redirect('https://jvoltci.github.io/flai/#/error');
-                    }
-                }
-                else {
-                    try {
-                        const request = https.get(url, (response) => {
-                            response.pipe(res);
-                        });
-                    }
-                    catch(error) {
-                        res.redirect('https://jvoltci.github.io/flai/#/error');
-                    }
-                }
-            }
-            )
+const handleLinks = async (req, res, db) => {
+    try {
+        const fetchedLink = req.params.id;
+        if (!fetchedLink || fetchedLink.length < 10) {
+            return res.redirect('https://jvoltci.github.io/flai');
         }
-        else {
-            password = '';
-            res.redirect('https://flai.ml');
+
+        const data = await db.collection('flai').findOne({ link: fetchedLink }, { projection: { url: 1 } });
+        
+        if (data && data.url) {
+            const targetUrl = data.url;
+            const client = targetUrl.startsWith('https') ? https : http;
+
+            client.get(targetUrl, (response) => {
+                // If it's a redirect, you might need to handle headers.location here
+                if ([301, 302, 303, 307, 308].includes(response.statusCode) && response.headers.location) {
+                    const redirectUrl = response.headers.location;
+                    const redirectClient = redirectUrl.startsWith('https') ? https : http;
+                    redirectClient.get(redirectUrl, (redirectResp) => redirectResp.pipe(res)).on('error', () => res.redirect('https://jvoltci.github.io/flai/#/error'));
+                } else {
+                    response.pipe(res);
+                }
+            }).on('error', () => {
+                res.redirect('https://jvoltci.github.io/flai/#/error');
+            });
+        } else {
+            return res.redirect('https://flai.ml');
         }
-    })
-    .catch(err => res.send(err))
-}
- 
-module.exports = {
-    handleLinks: handleLinks
-}
+    } catch (err) {
+        console.error('[links] Error:', err);
+        return res.status(500).send('Internal Error');
+    }
+};
+
+module.exports = { handleLinks };

@@ -1,7 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 const { MongoClient } = require("mongodb");
-const WebTorrent = require('webtorrent');
 
 const download = require('./routes/download');
 const links = require('./routes/links');
@@ -27,12 +26,10 @@ async function initDB() {
 }
 initDB();
 
-const client = new WebTorrent();
 const app = express();
 const port = process.env.PORT || 5000;
 
 // Cache to replace the buggy global magnetURI variable. 
-// Maps file_name -> magnetURI safely across concurrent requests.
 const magnetCache = new Map();
 
 app.use(cors());
@@ -49,20 +46,33 @@ app.use((req, res, next) => {
     next();
 });
 
-app.get('/', (req, res) => { res.send('It is working API v2') });
-app.post('/download', (req, res) => { download.handleDownload(req, res, db) });
-app.get('/links/:id', (req, res) => { links.handleLinks(req, res, db) });
-app.get('/play/:id', (req, res) => { play.handlePlay(req, res, db) });
-app.post('/metadata', (req, res) => { metadata.handleMetadata(req, res, client, magnetCache) });
-app.get('/torrent/:file_name', (req, res, next) => { torrentRoute.handleTorrent(req, res, next, client, db, magnetCache) });
-app.get('/torrents/:file_name', (req, res, next) => { torrentsRoute.handleTorrents(req, res, next, client, magnetCache) });
+// Modern WebTorrent uses Top-Level Await, so we must load it via dynamic import
+async function startServer() {
+    try {
+        const { default: WebTorrent } = await import('webtorrent');
+        const client = new WebTorrent();
+
+        app.get('/', (req, res) => { res.send('It is working API v2') });
+        app.post('/download', (req, res) => { download.handleDownload(req, res, db) });
+        app.get('/links/:id', (req, res) => { links.handleLinks(req, res, db) });
+        app.get('/play/:id', (req, res) => { play.handlePlay(req, res, db) });
+        app.post('/metadata', (req, res) => { metadata.handleMetadata(req, res, client, magnetCache) });
+        app.get('/torrent/:file_name', (req, res, next) => { torrentRoute.handleTorrent(req, res, next, client, db, magnetCache) });
+        app.get('/torrents/:file_name', (req, res, next) => { torrentsRoute.handleTorrents(req, res, next, client, magnetCache) });
+
+        app.listen(port, () => {
+            console.log(`App is running on port ${port}`);
+        });
+    } catch (err) {
+        console.error("Failed to initialize WebTorrent or start server:", err);
+    }
+}
 
 process.on('uncaughtException', (err) => {
     console.error('Error: Process', err);
 });
 
-app.listen(port, () => {
-    console.log(`App is running on port ${port}`);
-});
+// Boot it up
+startServer();
 
 module.exports = app;

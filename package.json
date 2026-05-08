@@ -1,19 +1,31 @@
 {
-  "name": "flai",
-  "version": "2.0.0",
-  "description": "State of the art torrent proxy",
-  "main": "server.js",
+  "name": "flai-api",
+  "version": "3.0.0",
+  "description": "flai — torrent-to-HTTP bridge. Browser-friendly streaming, Range support, and zero-fuss deployment.",
+  "type": "module",
+  "main": "src/server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "lint": "eslint src"
   },
   "dependencies": {
     "archiver": "^7.0.1",
+    "compression": "^1.7.5",
     "cors": "^2.8.5",
-    "express": "^4.19.2",
-    "mongodb": "^6.5.0",
-    "webtorrent": "^2.1.33"
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.4.1",
+    "helmet": "^8.0.0",
+    "mongodb": "^6.10.0",
+    "pino": "^9.5.0",
+    "pino-http": "^10.3.0",
+    "webtorrent": "^2.5.17",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "pino-pretty": "^11.3.0"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   }
 }

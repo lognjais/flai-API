@@ -7,19 +7,18 @@ import pinoHttp from 'pino-http';
 
 import { config, isProd } from './config.js';
 import { logger } from './logger.js';
-import { connectDb, closeDb } from './db.js';
-import { TorrentEngine } from './torrent-engine.js';
-import { startKeepWarm } from './lib/keep-warm.js';
+import { TorrentEngine } from './engine/index.js';
 import { HttpError } from './lib/errors.js';
+import { requireToken } from './lib/token.js';
 
+import { sessionRouter } from './routes/session.js';
 import { metadataRouter } from './routes/metadata.js';
-import { torrentRouter } from './routes/torrent.js';
-import { linksRouter } from './routes/links.js';
+import { streamRouter } from './routes/stream.js';
+import { statsRouter } from './routes/stats.js';
 import { healthRouter } from './routes/health.js';
 
 async function bootstrap() {
   const startedAt = Date.now();
-  await connectDb();
 
   const engine = new TorrentEngine();
   await engine.ready();
@@ -29,10 +28,14 @@ async function bootstrap() {
   app.disable('x-powered-by');
 
   app.use(pinoHttp({ logger, autoLogging: { ignore: (req) => req.url === '/healthz' } }));
-  app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: { policy: 'cross-origin' } }));
-  app.use(compression());
+  app.use(
+    helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: { policy: 'cross-origin' } })
+  );
+  /* Compression only helps /metadata on a large multi-file torrent — torrent payloads are
+   * already compressed, and gzipping a 32 MB video slice would burn the 0.1 vCPU this box
+   * has for nothing. */
+  app.use(compression({ filter: (req, res) => /^application\/json/.test(String(res.getHeader('Content-Type'))) }));
   app.use(express.json({ limit: '64kb' }));
-  app.use(express.urlencoded({ extended: true, limit: '64kb' }));
 
   app.use(
     cors({
@@ -42,32 +45,56 @@ async function bootstrap() {
         return cb(new Error(`origin ${origin} not allowed`));
       },
       methods: ['GET', 'POST', 'OPTIONS'],
-      allowedHeaders: ['Content-Type', 'Accept', 'Range'],
+      allowedHeaders: ['Content-Type', 'Accept', 'Range', 'Authorization'],
       exposedHeaders: ['Content-Length', 'Content-Range', 'Accept-Ranges', 'Content-Disposition'],
       maxAge: 86400,
     })
   );
 
-  // Tighter limit for write/auth-bearing endpoints; streaming is unlimited.
+  /* Two limiters. /session is the one worth grinding, so it is tight. /metadata is cheap to
+   * ask for and expensive to serve, so it is moderate. Streaming is not limited at all: a
+   * 4 GB download is ~500 legitimate chunk requests, and a limiter there would break the
+   * exact thing v4 exists to fix. */
+  const authLimiter = rateLimit({
+    windowMs: 15 * 60_000,
+    limit: 20,
+    standardHeaders: 'draft-8',
+    legacyHeaders: false,
+    message: { error: { code: 'rate_limited', message: 'too many sign-in attempts' } },
+  });
   const writeLimiter = rateLimit({
     windowMs: 60_000,
     limit: 30,
-    standardHeaders: 'draft-7',
+    standardHeaders: 'draft-8',
     legacyHeaders: false,
     message: { error: { code: 'rate_limited', message: 'too many requests' } },
   });
 
   app.get('/', (req, res) => {
-    res.json({ service: 'flai-api', version: '3.0.0', docs: 'https://github.com/jvoltci/flai-api' });
+    res.json({
+      service: 'flai-api',
+      version: '4.0.0',
+      docs: 'https://github.com/jvoltci/flai-api',
+      routes: [
+        'POST /session',
+        'POST /metadata',
+        'GET /torrent/:hash/:idx',
+        'GET /stats/:hash',
+        'GET /healthz',
+      ],
+    });
   });
 
   app.use('/healthz', healthRouter(engine, startedAt));
-  app.use('/metadata', writeLimiter, metadataRouter(engine));
-  app.use('/torrent', torrentRouter(engine));
-  app.use('/', writeLimiter, linksRouter());
+  app.use('/session', authLimiter, sessionRouter());
+  app.use('/metadata', writeLimiter, requireToken, metadataRouter(engine));
+  app.use('/torrent', requireToken, streamRouter(engine));
+  app.use('/stats', requireToken, statsRouter(engine));
 
   app.use((req, res) => {
-    res.status(404).json({ error: { code: 'not_found', message: `no route for ${req.method} ${req.path}` } });
+    res
+      .status(404)
+      .json({ error: { code: 'not_found', message: `no route for ${req.method} ${req.path}` } });
   });
 
   app.use((err, req, res, next) => {
@@ -82,23 +109,22 @@ async function bootstrap() {
       return res.status(403).json({ error: { code: 'forbidden', message: err.message } });
     }
     req.log?.error({ err: err.message, stack: err.stack }, 'unhandled error');
-    res.status(500).json({ error: { code: 'internal', message: isProd ? 'internal error' : err.message } });
+    res
+      .status(500)
+      .json({ error: { code: 'internal', message: isProd ? 'internal error' : err.message } });
   });
 
   const server = app.listen(config.PORT, () => {
     logger.info({ port: config.PORT, env: config.NODE_ENV }, 'flai-api listening');
   });
 
-  const stopKeepWarm = startKeepWarm();
-
   let shuttingDown = false;
   const shutdown = async (signal) => {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info({ signal }, 'shutdown initiated');
-    stopKeepWarm();
     server.close(() => logger.info('http closed'));
-    await Promise.allSettled([engine.destroy(), closeDb()]);
+    await engine.destroy();
     setTimeout(() => process.exit(0), 100).unref();
   };
 

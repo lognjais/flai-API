@@ -11,15 +11,18 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      # Node 20 reached end of life on 30 April 2026. 24 is Active LTS until 30 April 2028,
+      # which is the point of pinning it: nothing to do here for 20 months.
+      - key: NODE_VERSION
+        value: "24"
       - key: PASS
-        sync: false
-      - key: DATABASE
         sync: false
       - key: ALLOWED_ORIGINS
         value: https://jvoltci.github.io,https://flai.ivehement.com
-      - key: PUBLIC_URL
-        value: https://flai-api.onrender.com
-      - key: KEEP_WARM_INTERVAL_MS
-        value: "600000"
       - key: LOG_LEVEL
         value: info
+      # No keep-warm any more. v3 self-pinged every 10 minutes to dodge the 15-minute
+      # spin-down, which burned ~730 of the 750 free instance-hours in a month and left no
+      # margin for a restart. v4 accepts the ~1 minute cold start and says so in the UI.
+      #
+      # No DATABASE either: the client holds the magnets, so there is nothing to store.

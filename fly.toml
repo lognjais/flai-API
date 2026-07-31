@@ -1,3 +1,9 @@
+# Kept for self-hosting, but read this first: Fly.io replaced its free allowances with a
+# 2-hour trial in 2024. Only accounts that predate that change still get the three 256 MB
+# machines. On a new account this config costs money.
+#
+# Render's free tier is what flai-api is actually tuned for — see render.yaml.
+
 app = "flai-api"
 primary_region = "iad"
 
@@ -7,21 +13,24 @@ primary_region = "iad"
 [env]
   NODE_ENV = "production"
   ALLOWED_ORIGINS = "https://jvoltci.github.io,https://flai.ivehement.com"
-  KEEP_WARM_INTERVAL_MS = "600000"
   LOG_LEVEL = "info"
 
 [http_service]
   internal_port = 5000
   force_https = true
-  # The whole point of choosing Fly: the machine never auto-stops.
+  # The reason to pick Fly over Render: the machine never auto-stops, so there is no cold
+  # start and no 15-minute spin-down to design around.
   auto_stop_machines = false
   auto_start_machines = true
   min_machines_running = 1
 
+  # Two torrents, one reader each, plus a stats stream per open tab. The old limits of
+  # 200/250 were sized for a service that could serve 200 things at once; this one cannot,
+  # and letting it try just means every request is slow instead of some being refused.
   [http_service.concurrency]
     type = "requests"
-    soft_limit = 200
-    hard_limit = 250
+    soft_limit = 24
+    hard_limit = 32
 
   [[http_service.checks]]
     grace_period = "10s"
@@ -32,4 +41,6 @@ primary_region = "iad"
 
 [[vm]]
   size = "shared-cpu-1x"
-  memory = "256mb"
+  # 256 MB was already too small for v3 and is definitely too small for a 64 MB window plus
+  # peer buffers. 512 MB matches what the defaults in config.js are sized against.
+  memory = "512mb"

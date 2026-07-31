@@ -1,9 +1,11 @@
-FROM node:20-alpine AS deps
+# Node 20 reached end of life on 30 April 2026, which is what this image used to pin.
+# 24 is Active LTS until 30 April 2028.
+FROM node:24-alpine AS deps
 WORKDIR /app
 COPY package.json ./
 RUN npm install --omit=dev --no-audit --no-fund
 
-FROM node:20-alpine
+FROM node:24-alpine
 WORKDIR /app
 ENV NODE_ENV=production
 COPY --from=deps /app/node_modules ./node_modules

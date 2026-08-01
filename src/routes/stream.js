@@ -1,5 +1,4 @@
 import { Router } from 'express';
-import { once } from 'node:events';
 import { config } from '../config.js';
 import { logger } from '../logger.js';
 import { contentTypeFor, parseMagnet } from '../lib/magnet.js';
@@ -9,6 +8,29 @@ import { windows } from '../lib/windowed.js';
 import { badRequest, conflict, notFound, rangeNotSatisfiable } from '../lib/errors.js';
 
 const HEX40 = /^[a-f0-9]{40}$/i;
+
+/* Waits for the response to accept more bytes, and gives up if nobody is reading it any more.
+ *
+ * The timeout is the whole point. `once(res, 'drain')` waits on an event that a socket nobody
+ * is reading will never emit, and that one await is what left a cancelled download holding the
+ * torrent until the process restarted. */
+function waitForDrain(res, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const settle = (err) => {
+      clearTimeout(timer);
+      res.off('drain', ok);
+      res.off('close', gone);
+      if (err) reject(err);
+      else resolve();
+    };
+    const ok = () => settle();
+    const gone = () => settle(new Error('the client went away'));
+    const timer = setTimeout(() => settle(new Error('the client stopped reading')), timeoutMs);
+    timer.unref?.();
+    res.once('drain', ok);
+    res.once('close', gone);
+  });
+}
 
 function findFile(torrent, key) {
   const index = Number(key);
@@ -103,38 +125,80 @@ export function streamRouter(engine) {
       logger.info({ infoHash }, 'took the read over from an earlier request');
     }
 
-    /* Two ways this read ends early, and both must actually unblock it.
+    /* A dry run of everything above, for the page to call before it starts a download.
      *
-     * The bug: a client that goes away mid-transfer left `await once(res, 'drain')` parked on
-     * an event that could never fire, because the socket it would have come from was gone. The
-     * read was never released, so the torrent could never be evicted and every later request
-     * for it answered "busy" — for the life of the process. Wiring 'close' to the signal is the
-     * fix; everything else here just makes the same signal serve the handover too. */
+     * Once a URL is handed to the browser's download manager the page gets no say in it: a 409
+     * is not an error the user sees, it is a 120-byte JSON file saved under the name of the
+     * episode they wanted. Asking first is the only way to put that answer on the page. Costs
+     * one round trip and touches no pieces. */
+    if (req.query.probe === '1') return res.status(204).end();
+
+    /* Ending this read early is harder than it looks, and getting it wrong is what made a
+     * cancelled download block the torrent for good.
+     *
+     * res 'close' is the obvious signal and it is not enough. It fires for curl, which is why
+     * the first attempt at this measured as fixed from the command line and changed nothing for
+     * a browser. Cancelling a browser download resets the HTTP/2 stream to the edge proxy; the
+     * proxy keeps its upstream HTTP/1.1 connection pooled and simply stops reading it. No FIN,
+     * no 'close' — just a socket that has quietly stopped accepting bytes. So the read also
+     * has to notice that for itself, below. */
     const stop = new AbortController();
     res.on('close', () => stop.abort(new Error('client went away')));
 
     let written = 0;
     let lastProgress = Date.now();
+    let parkedSince = null;
+
     const release = engine.trackStream(torrent, {
       abort: () => stop.abort(new Error('read handed over')),
-      /* What separates a download in progress from a socket nobody is on the other end of.
-       * A live client drains many times a second however slow its connection, because the
-       * response buffer is 16 KB; only a dead one stops entirely. */
-      healthy: () =>
-        !stop.signal.aborted &&
-        !res.destroyed &&
-        Date.now() - lastProgress < config.STREAM_STALL_MS,
+      healthy: () => {
+        if (stop.signal.aborted || res.destroyed) return false;
+        /* Parked waiting for the client to take more bytes. A live client clears this in well
+         * under a second whatever its speed, because the response buffer is 16 KB — so a few
+         * seconds of it means nobody is on the other end. */
+        if (parkedSince !== null) return Date.now() - parkedSince < config.DRAIN_GRACE_MS;
+        // Waiting on the swarm instead, which is legitimate and slow on a cold torrent.
+        return Date.now() - lastProgress < config.STREAM_STALL_MS;
+      },
     });
 
+    /* One rejection for the whole read, raced against every wait below.
+     *
+     * It has to be one, not one per wait: a 1 GB episode is ~16,000 chunks, and an abort
+     * listener per chunk is a listener leak. */
+    const aborted = new Promise((_, reject) => {
+      const fail = () => reject(stop.signal.reason);
+      if (stop.signal.aborted) fail();
+      else stop.signal.addEventListener('abort', fail, { once: true });
+    });
+    aborted.catch(() => {}); // raced repeatedly, so it must never look unhandled
+
+    const reader = windows(file, config.READ_WINDOW_BYTES, start, end, stop.signal);
     try {
       res.writeHead(status, headers);
-      /* The bound — see lib/windowed.js. Backpressure does the rest: if the client reads slowly,
-       * res.write() blocks here and the swarm is never asked to run ahead of what is actually
-       * being consumed. */
-      for await (const chunk of windows(file, config.READ_WINDOW_BYTES, start, end, stop.signal)) {
-        written += chunk.length;
+      /* The bound — see lib/windowed.js. Backpressure does the rest: if the client reads
+       * slowly, the drain below blocks here and the swarm is never asked to run ahead of what
+       * is actually being consumed.
+       *
+       * Not `for await`, because the read has to be able to give up on the generator. Peers go
+       * quiet and a window can stall indefinitely, and webtorrent's file streams are streamx
+       * rather than node streams: destroying a stalled streamx Readable does not reject an
+       * in-flight iteration — measured, it stays parked for ever. Destroying it still drops the
+       * piece selection, which is the part that costs memory; racing here is what lets the
+       * route stop waiting for it. */
+      for (;;) {
+        const next = await Promise.race([reader.next(), aborted]);
+        if (next.done) break;
+        written += next.value.length;
+        if (!res.write(next.value)) {
+          parkedSince = Date.now();
+          try {
+            await Promise.race([waitForDrain(res, config.DRAIN_TIMEOUT_MS), aborted]);
+          } finally {
+            parkedSince = null;
+          }
+        }
         lastProgress = Date.now();
-        if (!res.write(chunk)) await once(res, 'drain', { signal: stop.signal });
       }
       res.end();
     } catch (err) {
@@ -146,6 +210,8 @@ export function streamRouter(engine) {
       }
       if (!res.destroyed) res.destroy();
     } finally {
+      // Never awaited: if the generator is parked on a stalled streamx read, this never settles.
+      reader.return().catch(() => {});
       release(written);
     }
 

@@ -34,10 +34,15 @@ export function windowedStream(file, windowBytes, start = 0, end = file.length -
 }
 
 /**
- * @param {AbortSignal} [signal] stops the read wherever it is, including mid-window. Closing
- *   the generator is not enough on its own: a window waiting on pieces that will never arrive
- *   leaves the generator suspended inside its own `for await`, where `.return()` cannot reach
- *   it until the next chunk lands. Destroying the stream is what actually unblocks it.
+ * @param {AbortSignal} [signal] drops the current window's piece selection as soon as the read
+ *   is abandoned, rather than waiting for the consumer to come back and close the generator.
+ *
+ *   It does *not* promise to wake the consumer. webtorrent's file streams are streamx, not node
+ *   streams, and destroying a stalled streamx Readable does not reject an iteration already in
+ *   flight — measured, it stays parked indefinitely. So a caller that must be able to give up
+ *   has to race `next()` against its own signal; see routes/stream.js. What this does buy is
+ *   the expensive half: the selection goes away immediately, so the swarm stops fetching for a
+ *   reader that has left.
  */
 export async function* windows(file, windowBytes, start = 0, end = file.length - 1, signal) {
   for (let at = start; at <= end; ) {

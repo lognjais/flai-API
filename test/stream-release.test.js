@@ -66,9 +66,10 @@ function fakeTorrent() {
 
 /* Everything the route touches, backed by the real ReaderLock so the handover path is the
  * production one and not a test-shaped imitation of it. */
-function harness({ stallMs } = {}) {
-  if (stallMs !== undefined) config.STREAM_STALL_MS = stallMs;
-  else config.STREAM_STALL_MS = 120_000;
+function harness({ stallMs = 120_000, drainGraceMs = 3_000 } = {}) {
+  config.STREAM_STALL_MS = stallMs;
+  config.DRAIN_GRACE_MS = drainGraceMs;
+  config.DRAIN_TIMEOUT_MS = 60_000;
   const torrent = fakeTorrent();
   const lock = new ReaderLock();
   const engine = {
@@ -151,9 +152,9 @@ test('and the next download of the same torrent just works', async (t) => {
 
 /* A client that vanishes without closing the socket — a slept laptop, a dropped wifi — looks
  * identical to a healthy reader from here, and the socket can sit for minutes before TCP gives
- * up. STREAM_STALL_MS=0 is that reader with the waiting already done. */
+ * up. Zeroing both graces is that reader with the waiting already done. */
 test('a new request takes the read over from a stalled one', async (t) => {
-  const { engine, server, stop, ready } = harness({ stallMs: 0 });
+  const { engine, server, stop, ready } = harness({ stallMs: 0, drainGraceMs: 0 });
   await ready;
   t.after(stop);
 
@@ -242,6 +243,47 @@ test('A pauses, B finishes, A resumes and gets the right bytes', async (t) => {
   assert.equal(a2.body.length, END - resumeFrom + 1);
   assert.ok(a2.body.every((byte) => byte === 7), 'and the bytes are the right ones');
   assert.equal(torrent.file.open, 0, 'no window left open behind any of it');
+});
+
+/* The page asks before handing a URL to the browser's download manager, because a 409 handed
+ * to a download manager is a JSON file on disk named after the episode, not an error message. */
+test('a probe answers the same question without reading a byte', async (t) => {
+  const { engine, torrent, server, stop, ready } = harness();
+  await ready;
+  t.after(stop);
+  const port = server.address().port;
+
+  const probe = (path) =>
+    new Promise((resolve) => {
+      const req = http.get({ port, path }, (res) => {
+        res.resume();
+        res.on('end', () => resolve(res.statusCode));
+      });
+      req.on('error', () => {});
+    });
+
+  assert.equal(await probe(`/torrent/${HASH}/0?probe=1`), 204, 'free');
+  assert.equal(torrent.file.open, 0, 'and it never opened the file');
+  assert.equal(engine.streamCount(HASH), 0, 'nor held the window');
+
+  assert.equal(await probe(`/torrent/${HASH}/99?probe=1`), 404, 'same 404 as the real request');
+  assert.equal(
+    await probe(`/torrent/${HASH}/0?probe=1&x=1`),
+    204,
+    'unknown query params are ignored'
+  );
+
+  // With a live download running, the probe reports the refusal instead of the page finding out
+  // by way of a junk file in the downloads folder.
+  const live = startDownload(server);
+  const [liveRes] = await once(live, 'response');
+  liveRes.resume();
+  await waitFor(() => engine.streamCount(HASH) === 1, 2000, 'the live read to open');
+  assert.equal(await probe(`/torrent/${HASH}/0?probe=1`), 409);
+
+  live.destroy();
+  await waitFor(() => engine.streamCount(HASH) === 0, 3000, 'the live read to be released');
+  assert.equal(await probe(`/torrent/${HASH}/0?probe=1`), 204, 'free again');
 });
 
 test('a download that finishes normally releases too', async (t) => {

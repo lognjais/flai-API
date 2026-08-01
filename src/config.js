@@ -69,12 +69,24 @@ const Schema = z.object({
    * a destroyed stream and a finally block, so it takes milliseconds; this is only generous
    * enough that a busy event loop cannot make a handover look like a refusal. */
   STREAM_HANDOVER_MS: z.coerce.number().int().positive().default(5_000),
-  /* After this long with no bytes written, a read counts as abandoned and a new request may
-   * take the window from it. Well clear of a cold start: the measurements below put first
-   * bytes at ~47s on a torrent with no peers yet, and that read deserves to keep its slot. A
-   * live client cannot trip this however slow it is — the response buffer is 16 KB, so it
-   * drains many times a second. Only a socket with nobody on the other end goes quiet. */
+  /* Two different silences, and they need very different patience.
+   *
+   * STREAM_STALL_MS is a read waiting on the *swarm*: no pieces yet. Legitimate, and slow —
+   * the measurements below put first bytes at ~47s on a cold torrent, and that read deserves
+   * to keep its slot.
+   *
+   * DRAIN_GRACE_MS is a read waiting on the *client* to take bytes it has already produced.
+   * Nothing like the same thing. The response buffer is 16 KB, so any client that is still
+   * there clears it in well under a second; a few seconds of silence means nobody is reading.
+   * That is the ordinary state of a cancelled browser download, because the edge proxy keeps
+   * its upstream connection pooled and just stops draining it — no FIN, no 'close'. Past this,
+   * a new request may take the window.
+   *
+   * DRAIN_TIMEOUT_MS is when such a read gives up unasked, so a phantom clears itself even if
+   * nobody else ever wants the torrent. */
   STREAM_STALL_MS: z.coerce.number().int().positive().default(120_000),
+  DRAIN_GRACE_MS: z.coerce.number().int().positive().default(3_000),
+  DRAIN_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
   TORRENT_IDLE_EVICT_MS: z.coerce.number().int().positive().default(5 * 60 * 1000),
 
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),

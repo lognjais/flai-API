@@ -14,7 +14,6 @@ import { requireToken } from './lib/token.js';
 import { sessionRouter } from './routes/session.js';
 import { metadataRouter } from './routes/metadata.js';
 import { streamRouter } from './routes/stream.js';
-import { archiveRouter } from './routes/archive.js';
 import { statsRouter } from './routes/stats.js';
 import { healthRouter } from './routes/health.js';
 
@@ -80,7 +79,6 @@ async function bootstrap() {
         'POST /session',
         'POST /metadata',
         'GET /torrent/:hash/:idx',
-        'GET /torrent/:hash (zip)',
         'GET /stats/:hash',
         'GET /healthz',
       ],
@@ -90,9 +88,7 @@ async function bootstrap() {
   app.use('/healthz', healthRouter(engine, startedAt));
   app.use('/session', authLimiter, sessionRouter());
   app.use('/metadata', writeLimiter, requireToken, metadataRouter(engine));
-  /* Both mount at /torrent: the archive router answers /:infoHash, the stream router answers
-   * /:infoHash/:fileKey. Distinct paths, so the order between them does not matter. */
-  app.use('/torrent', requireToken, streamRouter(engine), archiveRouter(engine));
+  app.use('/torrent', requireToken, streamRouter(engine));
   app.use('/stats', requireToken, statsRouter(engine));
 
   app.use((req, res) => {
@@ -135,9 +131,25 @@ async function bootstrap() {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('unhandledRejection', (reason) => logger.error({ reason }, 'unhandled rejection'));
+  /* One bad request must not take the service down with it.
+   *
+   * Render reported "Application exited early" during a very large download. Whatever the
+   * cause, this handler guaranteed the blast radius was the whole process: any uncaught error
+   * anywhere killed every in-flight transfer. Exiting on an uncaught exception is the textbook
+   * advice because the process may be in an unknown state — but a stream error thrown from a
+   * socket that has already gone away is a known state, and it is the common case here.
+   *
+   * So: log it, keep serving, and only exit if they arrive in a burst, which does suggest the
+   * process is genuinely broken rather than that one client hung up. */
+  let recentUncaught = 0;
   process.on('uncaughtException', (err) => {
-    logger.fatal({ err: err.message, stack: err.stack }, 'uncaught — exiting');
-    shutdown('uncaughtException');
+    recentUncaught++;
+    setTimeout(() => recentUncaught--, 60_000).unref();
+    if (recentUncaught > 5) {
+      logger.fatal({ err: err.message, stack: err.stack }, 'uncaught storm — exiting');
+      return shutdown('uncaughtException');
+    }
+    logger.error({ err: err.message, stack: err.stack }, 'uncaught — surviving');
   });
 }
 

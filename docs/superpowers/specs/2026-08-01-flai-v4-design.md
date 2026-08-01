@@ -123,11 +123,23 @@ This is what deletes MongoDB, `db.js`, and the Atlas 60-day idle-pause chore.
 as `Authorization: Bearer` or `?t=`, because `<video src>` cannot set headers. This closes a
 real hole: v3's stream URLs were entirely unauthenticated against a 100 GB/month cap.
 
-**Client `download-manager.ts`** — the actual downloader. Sequential 8 MB `Range` chunks,
-retry with backoff, progress in IndexedDB, bytes written straight to disk through
-`showSaveFilePicker()`. The loop is `await`-driven, never timer-driven: Chrome clamps
-`setTimeout` in a hidden tab to once a minute after 5 minutes, which would throttle a
-timer-scheduled loop to a crawl.
+**Client `public/sw.js`** — the actual downloader, revised after the first implementation.
+
+The original design used the File System Access API: `showDirectoryPicker()` once, then
+`showSaveFilePicker()` and `requestPermission()` per resume, with the queue in IndexedDB. It
+worked, but it cost a folder picker, a permission prompt, a three-tab UI to manage the queue,
+and it had a real defect — `requestPermission()` needs transient user activation, and the call
+sat several promise ticks behind the click that triggered it.
+
+Replaced with a service worker answering one invented URL with a `ReadableStream`. The worker
+loops 8 MB `Range` slices behind that stream, so Chrome sees a single native download with the
+correct `Content-Length`, lands it in Downloads with no prompt, and draws its own progress bar.
+Server restarts, cold starts and dropped connections are handled inside the stream and never
+reach the browser.
+
+What it gives up: resume after the tab closes, because a native download cannot be restarted at
+an offset. Everything that actually goes wrong in practice is invisible; the one unrecoverable
+case is the one the user controls.
 
 **Client `probe.ts`** — fetches the first 512 KB, sniffs the container (MP4 `ftyp`/`moov`,
 Matroska EBML `CodecID`), and asks `MediaSource.isTypeSupported`. When Chrome cannot decode
@@ -158,8 +170,8 @@ idle RSS is ~115 MB, and one active torrent serving 38 MB of a 129 MB file sat a
 - **The zip route is removed.** `archiver` opens read streams for every file up front, which
   selects every piece at once and defeats the window bound. Per-file download has resume and
   per-file progress, which the zip never had.
-- **The tab must stay open** for bytes to flow. It may be minimised or backgrounded. Close it
-  and the download pauses, then resumes from the exact byte on reopen.
+- **The tab must stay open** for bytes to flow. It may be minimised or backgrounded. Closing it
+  ends the download for good — see the `public/sw.js` note above.
 - **HMAC tokens limit exposure, they are not a bandwidth cap.** A real monthly byte counter
   needs storage, and this design deletes storage. `/healthz` reports bytes served since boot.
 

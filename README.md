@@ -82,7 +82,7 @@ Errors are always `{ error: { code, message } }`. The codes the client branches 
 | code | status | meaning |
 |---|---|---|
 | `not_active` | 409 | re-`POST /metadata` and retry — expected, not a failure |
-| `busy` | 409 | another reader holds this torrent's single window |
+| `busy` | 409 | another file from this torrent is *actively* downloading — retry when it ends |
 | `range_not_satisfiable` | 416 | the range starts past the end of the file |
 | `at_capacity` | 409 | both slots are busy being read; nothing safe to evict |
 
@@ -129,8 +129,14 @@ Numbers measured on 2026-08-01, not estimated:
 
 Other limits worth knowing:
 
-- **One reader per torrent.** Two readers at different offsets would evict each other's pieces
-  and both would crawl. A second distant reader gets `409 busy`.
+- **One reader per torrent, and the window can be taken.** Two readers at different offsets
+  would evict each other's pieces and both would crawl, so only one file per torrent downloads
+  at a time. A newcomer takes the window from a read that is *not being used* — cancelled,
+  socket gone, or nothing written for `STREAM_STALL_MS` — and gets `409 busy` from one that is
+  actively writing bytes. Both halves matter: without the takeover a cancelled download made
+  the torrent permanently busy; without the refusal two people would interrupt each other in
+  turn and neither would finish. Pausing holds nothing — a resume is an ordinary `Range`
+  request that takes the window if it happens to be free.
 - **There is no zip-everything route, and it is not coming back on this host.** It shipped, it
   worked, and it was removed after Render reported the process exiting during a ~10 GB archive.
   Measured with a synthetic 6 GB archive and no swarm: the pipeline is genuinely bounded — RSS

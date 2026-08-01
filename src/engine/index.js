@@ -1,6 +1,7 @@
 import { config } from '../config.js';
 import { logger } from '../logger.js';
 import { SlidingWindowStore, storeFor } from './window-store.js';
+import { ReaderLock } from './reader-lock.js';
 
 /* Trackers on top of whatever the magnet carries. The WSS entries are near-useless for a
  * Node client fetching real swarms — qBittorrent and Transmission ship WebTorrent support
@@ -23,7 +24,7 @@ export class TorrentEngine {
   #uris = new Map();           // infoHash -> magnet, so reset() can re-add
   #pending = new Map();        // infoHash -> Promise<Torrent>
   #lastTouched = new Map();    // infoHash -> ms
-  #streams = new Map();        // infoHash -> active stream count
+  #readers = new ReaderLock(); // one open read per torrent, newcomer wins
   #evictTimer = null;
   #bytesServed = 0;
 
@@ -168,7 +169,8 @@ export class TorrentEngine {
   #forget(infoHash) {
     this.#torrents.delete(infoHash);
     this.#lastTouched.delete(infoHash);
-    this.#streams.delete(infoHash);
+    // The torrent is going away, so anyone still reading it has to be told, not just dropped.
+    this.#readers.abortAll(infoHash);
   }
 
   #touch(infoHash) {
@@ -179,7 +181,7 @@ export class TorrentEngine {
     const cutoff = Date.now() - config.TORRENT_IDLE_EVICT_MS;
     for (const infoHash of [...this.#torrents.keys()]) {
       const idle = (this.#lastTouched.get(infoHash) ?? 0) < cutoff;
-      if (idle && (this.#streams.get(infoHash) ?? 0) === 0) this.#remove(infoHash, 'idle');
+      if (idle && this.streamCount(infoHash) === 0) this.#remove(infoHash, 'idle');
     }
   }
 
@@ -218,18 +220,27 @@ export class TorrentEngine {
 
   /** How many HTTP reads are open on this torrent. One window, so one reader. */
   streamCount(infoHash) {
-    return this.#streams.get(infoHash) ?? 0;
+    return this.#readers.count(infoHash);
   }
 
-  trackStream(torrent) {
+  /**
+   * @param {object} [opts] see ReaderLock#acquire — abort, and whether this read is still live
+   * @returns {(bytes?: number) => void} release
+   */
+  trackStream(torrent, opts) {
     const h = torrent.infoHash;
-    this.#streams.set(h, this.streamCount(h) + 1);
+    const release = this.#readers.acquire(h, opts);
     this.#touch(h);
     return (bytes = 0) => {
       this.#bytesServed += bytes;
-      this.#streams.set(h, Math.max(0, this.streamCount(h) - 1));
+      release();
       this.#touch(h);
     };
+  }
+
+  /** Asks whoever is reading this torrent to stop. @returns whether the window is now free. */
+  takeOver(infoHash) {
+    return this.#readers.takeOver(infoHash, config.STREAM_HANDOVER_MS);
   }
 
   stats() {
@@ -256,7 +267,7 @@ export class TorrentEngine {
     this.#pending.clear();
     this.#uris.clear();
     this.#lastTouched.clear();
-    this.#streams.clear();
+    this.#readers.clear();
     if (this.#client) {
       await new Promise((resolve) => this.#client.destroy(() => resolve()));
       logger.info('torrent engine destroyed');

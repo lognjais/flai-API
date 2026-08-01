@@ -59,12 +59,6 @@ export function streamRouter(engine) {
       throw conflict('torrent not active — POST /metadata with the magnet, then retry', 'not_active');
     }
 
-    /* One sliding window per torrent, so one reader per torrent. Two readers at different
-     * offsets would evict each other's pieces and both would crawl. */
-    if (engine.streamCount(infoHash) > 0) {
-      throw conflict('another read is already open on this torrent', 'busy');
-    }
-
     const file = findFile(torrent, decodeURIComponent(req.params.fileKey));
     if (!file) throw notFound('file not found in torrent');
 
@@ -91,26 +85,66 @@ export function streamRouter(engine) {
     // RFC 8187 parsing and made every episode of a series download as a file called "0".
     if (req.query.dl === '1') headers['Content-Disposition'] = contentDisposition(file.name);
 
-    const release = engine.trackStream(torrent);
-    res.writeHead(status, headers);
+    /* One sliding window per torrent, so one reader per torrent — but a read nobody is using
+     * can be taken from it.
+     *
+     * This used to refuse every newcomer outright, which was the wrong half of the problem: a
+     * cancelled read looks exactly like a healthy one from here, so cancelling a download and
+     * starting another answered "busy" for the rest of the process's life. See
+     * engine/reader-lock.js for what separates the two. Last thing before the read starts, so a
+     * request that is about to 404 or 416 never disturbs whoever holds it. */
+    if (engine.streamCount(infoHash) > 0) {
+      if (!(await engine.takeOver(infoHash))) {
+        throw conflict(
+          'another file from this torrent is downloading — it frees up when that one finishes',
+          'busy'
+        );
+      }
+      logger.info({ infoHash }, 'took the read over from an earlier request');
+    }
+
+    /* Two ways this read ends early, and both must actually unblock it.
+     *
+     * The bug: a client that goes away mid-transfer left `await once(res, 'drain')` parked on
+     * an event that could never fire, because the socket it would have come from was gone. The
+     * read was never released, so the torrent could never be evicted and every later request
+     * for it answered "busy" — for the life of the process. Wiring 'close' to the signal is the
+     * fix; everything else here just makes the same signal serve the handover too. */
+    const stop = new AbortController();
+    res.on('close', () => stop.abort(new Error('client went away')));
 
     let written = 0;
+    let lastProgress = Date.now();
+    const release = engine.trackStream(torrent, {
+      abort: () => stop.abort(new Error('read handed over')),
+      /* What separates a download in progress from a socket nobody is on the other end of.
+       * A live client drains many times a second however slow its connection, because the
+       * response buffer is 16 KB; only a dead one stops entirely. */
+      healthy: () =>
+        !stop.signal.aborted &&
+        !res.destroyed &&
+        Date.now() - lastProgress < config.STREAM_STALL_MS,
+    });
+
     try {
-      /* The bound, shared with the zip route — see lib/windowed.js. Backpressure does the rest:
-       * if the client reads slowly, res.write() blocks here and the swarm is never asked to run
-       * ahead of what is actually being consumed. */
-      for await (const chunk of windows(file, config.READ_WINDOW_BYTES, start, end)) {
-        if (res.destroyed) return;
+      res.writeHead(status, headers);
+      /* The bound — see lib/windowed.js. Backpressure does the rest: if the client reads slowly,
+       * res.write() blocks here and the swarm is never asked to run ahead of what is actually
+       * being consumed. */
+      for await (const chunk of windows(file, config.READ_WINDOW_BYTES, start, end, stop.signal)) {
         written += chunk.length;
-        if (!res.write(chunk)) await once(res, 'drain');
+        lastProgress = Date.now();
+        if (!res.write(chunk)) await once(res, 'drain', { signal: stop.signal });
       }
       res.end();
     } catch (err) {
-      // A client closing the tab mid-download is normal, not a fault.
-      if (!res.destroyed) {
+      // A cancelled download, or a read handed to someone else. Neither is a fault.
+      if (stop.signal.aborted || res.destroyed) {
+        logger.debug({ infoHash, file: file.name, written }, 'read ended early');
+      } else {
         logger.warn({ err: err.message, infoHash, file: file.name, written }, 'stream error');
-        res.destroy();
       }
+      if (!res.destroyed) res.destroy();
     } finally {
       release(written);
     }

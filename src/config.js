@@ -65,6 +65,16 @@ const Schema = z.object({
    * with no inbound connections. */
   MAX_CONNS: z.coerce.number().int().positive().default(100),
   METADATA_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
+  /* How long a new read waits for the previous one to let go of the same torrent. Unwinding is
+   * a destroyed stream and a finally block, so it takes milliseconds; this is only generous
+   * enough that a busy event loop cannot make a handover look like a refusal. */
+  STREAM_HANDOVER_MS: z.coerce.number().int().positive().default(5_000),
+  /* After this long with no bytes written, a read counts as abandoned and a new request may
+   * take the window from it. Well clear of a cold start: the measurements below put first
+   * bytes at ~47s on a torrent with no peers yet, and that read deserves to keep its slot. A
+   * live client cannot trip this however slow it is — the response buffer is 16 KB, so it
+   * drains many times a second. Only a socket with nobody on the other end goes quiet. */
+  STREAM_STALL_MS: z.coerce.number().int().positive().default(120_000),
   TORRENT_IDLE_EVICT_MS: z.coerce.number().int().positive().default(5 * 60 * 1000),
 
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),

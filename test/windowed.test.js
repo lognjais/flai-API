@@ -127,6 +127,46 @@ test('abandoning the read closes the window it was on', async () => {
   assert.equal(file.open, 0, 'the in-flight window was destroyed on early return');
 });
 
+/* The case the HTTP tests cannot reach: a window waiting on pieces that never arrive. The
+ * generator is suspended inside its own `for await`, where closing it politely cannot reach it
+ * until the next chunk lands — which is never. Destroying the stream is what unblocks it. */
+test('an abort unblocks a window that is waiting on pieces that never come', async () => {
+  const file = fakeFile(8 * WINDOW);
+  const stalled = new Readable({ read() {} }); // yields nothing, ever
+  file.createReadStream = () => {
+    file.open++;
+    stalled.on('close', () => file.open--);
+    return stalled;
+  };
+
+  const stop = new AbortController();
+  const reading = collect(windows(file, WINDOW, 0, 8 * WINDOW - 1, stop.signal));
+  await new Promise((r) => setImmediate(r));
+  assert.equal(file.open, 1, 'parked mid-window');
+
+  stop.abort(new Error('client went away'));
+  await assert.rejects(reading, /client went away/);
+  assert.equal(file.open, 0, 'the stalled window was destroyed, not left behind');
+});
+
+test('an abort between windows stops before opening the next one', async () => {
+  const file = fakeFile(8 * WINDOW);
+  const stop = new AbortController();
+  const iterator = windows(file, WINDOW, 0, 8 * WINDOW - 1, stop.signal);
+  await iterator.next();
+  await iterator.return(); // finishes the current window
+  stop.abort(new Error('handed over'));
+  assert.equal(file.log.length, 1, 'only the first window was ever opened');
+});
+
+test('an abort before the first read opens nothing at all', async () => {
+  const file = fakeFile(8 * WINDOW);
+  const stop = new AbortController();
+  stop.abort(new Error('handed over'));
+  await assert.rejects(collect(windows(file, WINDOW, 0, 8 * WINDOW - 1, stop.signal)), /handed over/);
+  assert.equal(file.log.length, 0);
+});
+
 test('a zero-length file reads as nothing and opens nothing', async () => {
   const file = fakeFile(0);
   assert.equal((await collect(windows(file, WINDOW))).length, 0);

@@ -33,13 +33,23 @@ export function windowedStream(file, windowBytes, start = 0, end = file.length -
   return Readable.from(windows(file, windowBytes, start, end));
 }
 
-export async function* windows(file, windowBytes, start = 0, end = file.length - 1) {
+/**
+ * @param {AbortSignal} [signal] stops the read wherever it is, including mid-window. Closing
+ *   the generator is not enough on its own: a window waiting on pieces that will never arrive
+ *   leaves the generator suspended inside its own `for await`, where `.return()` cannot reach
+ *   it until the next chunk lands. Destroying the stream is what actually unblocks it.
+ */
+export async function* windows(file, windowBytes, start = 0, end = file.length - 1, signal) {
   for (let at = start; at <= end; ) {
+    signal?.throwIfAborted();
     const stop = Math.min(end, at + windowBytes - 1);
     const window = file.createReadStream({ start: at, end: stop });
+    const cancel = () => window.destroy(signal.reason);
+    signal?.addEventListener('abort', cancel, { once: true });
     try {
       for await (const chunk of window) yield chunk;
     } finally {
+      signal?.removeEventListener('abort', cancel);
       // Drops the piece selection even when the consumer walks away mid-window.
       window.destroy();
     }

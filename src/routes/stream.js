@@ -4,6 +4,7 @@ import { config } from '../config.js';
 import { logger } from '../logger.js';
 import { contentTypeFor, parseMagnet } from '../lib/magnet.js';
 import { resolveRange } from '../lib/range.js';
+import { contentDisposition } from '../lib/filename.js';
 import { windows } from '../lib/windowed.js';
 import { badRequest, conflict, notFound, rangeNotSatisfiable } from '../lib/errors.js';
 
@@ -86,9 +87,9 @@ export function streamRouter(engine) {
       'X-Content-Type-Options': 'nosniff',
     };
     if (status === 206) headers['Content-Range'] = `bytes ${start}-${end}/${total}`;
-    if (req.query.dl === '1') {
-      headers['Content-Disposition'] = `attachment; filename*=UTF-8''${encodeURIComponent(file.name)}`;
-    }
+    // Not encodeURIComponent — see lib/filename.js. It leaves apostrophes alone, which breaks
+    // RFC 8187 parsing and made every episode of a series download as a file called "0".
+    if (req.query.dl === '1') headers['Content-Disposition'] = contentDisposition(file.name);
 
     const release = engine.trackStream(torrent);
     res.writeHead(status, headers);

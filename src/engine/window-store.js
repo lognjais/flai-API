@@ -10,10 +10,9 @@
  *
  * ── why forgetting is safe ────────────────────────────────────────────────────
  *
- * Because the reader is a download manager, not a random-access filesystem. It walks the
- * file forward in MAX_CHUNK_BYTES steps and only ever retries the chunk it is on. So the
- * pieces it can still ask for are the ones it just touched — which under LRU are exactly
- * the ones we keep.
+ * Because the reader walks the file forward in READ_WINDOW_BYTES windows and never goes back.
+ * The pieces it can still ask for are the ones it just touched — which under LRU are exactly
+ * the ones kept.
  *
  * LRU rather than "drop everything below the read head" is deliberate: `get` touches a
  * piece, so anything the current stream is actively reading is by definition the most
@@ -54,7 +53,7 @@ export class SlidingWindowStore {
     /* Four pieces is the floor, whatever the caller asks for. Piece length is chosen by
      * whoever made the torrent and can be 16 MB, so a budget expressed in bytes alone could
      * land below a single piece and evict the piece being read. */
-    this.#budget = Math.max(opts.budgetBytes ?? 64 * 1024 * 1024, chunkLength * 4);
+    this.#budget = Math.max(opts.budgetBytes ?? 32 * 1024 * 1024, chunkLength * 4);
     this.#infoHash = opts.torrent?.infoHash ?? null;
     if (this.#infoHash) registry.set(this.#infoHash, this);
   }

@@ -1,9 +1,8 @@
 import { Router } from 'express';
-import { Transform } from 'node:stream';
-import { pipeline } from 'node:stream/promises';
+import { once } from 'node:events';
 import { config } from '../config.js';
 import { logger } from '../logger.js';
-import { contentTypeFor } from '../lib/magnet.js';
+import { contentTypeFor, parseMagnet } from '../lib/magnet.js';
 import { resolveRange } from '../lib/range.js';
 import { badRequest, conflict, notFound, rangeNotSatisfiable } from '../lib/errors.js';
 
@@ -20,21 +19,46 @@ function findFile(torrent, key) {
 export function streamRouter(engine) {
   const router = Router();
 
-  // GET /torrent/:infoHash/:fileKey — one bounded slice of one file.
+  /* GET /torrent/:infoHash/:fileKey?t=…&m=<magnet>&dl=1
+   *
+   * One ordinary HTTP response for the whole file, so a plain <a download> works and Chrome's
+   * own download manager handles it — including resuming an interrupted download with
+   * `Range: bytes=N-`, which is why Accept-Ranges and a stable ETag are set.
+   *
+   * The memory bound lives inside the loop below, not in the protocol. v4.0 clamped every
+   * response to 16 MB and made the browser stitch the slices back together in a service
+   * worker. It bounded memory correctly and it was the wrong design: it needed a service
+   * worker to download a file, and when that did not work there was nothing to fall back to.
+   */
   router.get('/:infoHash/:fileKey', async (req, res) => {
     const infoHash = req.params.infoHash.toLowerCase();
     if (!HEX40.test(infoHash)) throw badRequest('invalid infohash');
 
-    const torrent = engine.get(infoHash);
-    /* Not an error — the contract. The server keeps no magnets, so it cannot resurrect a
-     * torrent that a spin-down or an eviction took away. The client holds the magnet and
-     * re-posts /metadata on this code, then retries. */
+    let torrent = engine.get(infoHash);
+
+    /* The URL carries its own magnet, so it can heal itself. The service holds no state, so a
+     * spin-down, a redeploy or a capacity eviction leaves it with no way to find this torrent
+     * again — but the link the browser is retrying has everything needed to re-add it. That is
+     * what makes Chrome's native download resume survive a server restart with no client-side
+     * code at all. */
+    if (!torrent && typeof req.query.m === 'string') {
+      const magnet = parseMagnet(req.query.m);
+      if (magnet && magnet.infoHash === infoHash) {
+        logger.info({ infoHash }, 're-adding torrent from the download URL');
+        try {
+          torrent = await engine.addOrGet(magnet);
+        } catch (err) {
+          logger.warn({ err: err.message, infoHash }, 're-add failed');
+        }
+      }
+    }
+
     if (!torrent) {
       throw conflict('torrent not active — POST /metadata with the magnet, then retry', 'not_active');
     }
 
-    /* One window per torrent, so one reader per torrent. Two readers at different offsets
-     * would evict each other's pieces and both would crawl. */
+    /* One sliding window per torrent, so one reader per torrent. Two readers at different
+     * offsets would evict each other's pieces and both would crawl. */
     if (engine.streamCount(infoHash) > 0) {
       throw conflict('another read is already open on this torrent', 'busy');
     }
@@ -43,12 +67,10 @@ export function streamRouter(engine) {
     if (!file) throw notFound('file not found in torrent');
 
     const total = file.length;
-    const { status, start, end } = resolveRange(req.headers.range, total, config.MAX_CHUNK_BYTES);
+    const { status, start, end } = resolveRange(req.headers.range, total);
     if (status === 416) {
       res.set('Accept-Ranges', 'bytes');
-      throw rangeNotSatisfiable(
-        `send a Range header of at most ${config.MAX_CHUNK_BYTES} bytes — this bridge streams in slices, never whole files`
-      );
+      throw rangeNotSatisfiable('that byte range is outside the file', 'range_not_satisfiable');
     }
 
     const expected = end - start + 1;
@@ -56,45 +78,56 @@ export function streamRouter(engine) {
       'Accept-Ranges': 'bytes',
       'Content-Type': contentTypeFor(file.name),
       'Content-Length': expected,
+      // Chrome sends this back as If-Range when resuming a download; without it the resume is
+      // refused and the whole file starts over.
+      ETag: `"${infoHash}-${file.length}-${req.params.fileKey}"`,
       'Cache-Control': 'no-store',
       'X-Content-Type-Options': 'nosniff',
     };
     if (status === 206) headers['Content-Range'] = `bytes ${start}-${end}/${total}`;
     if (req.query.dl === '1') {
-      headers['Content-Disposition'] =
-        `attachment; filename*=UTF-8''${encodeURIComponent(file.name)}`;
+      headers['Content-Disposition'] = `attachment; filename*=UTF-8''${encodeURIComponent(file.name)}`;
     }
 
     const release = engine.trackStream(torrent);
-    let written = 0;
-    // Counting in a Transform rather than on a 'data' listener: attaching a listener to a
-    // stream that is also being piped puts two consumers on the same source.
-    const counter = new Transform({
-      transform(chunk, _enc, cb) {
-        written += chunk.length;
-        cb(null, chunk);
-      },
-    });
-
     res.writeHead(status, headers);
+
+    let written = 0;
     try {
-      await pipeline(file.createReadStream({ start, end }), counter, res);
+      /* The bound. Each createReadStream makes webtorrent select exactly the pieces it covers
+       * and drop the selection when it closes, so the engine never wants more than one window
+       * at a time however large the file is. Backpressure does the rest: if the client reads
+       * slowly, res.write() blocks here and the swarm is never asked to run ahead. */
+      for (let at = start; at <= end; ) {
+        const stop = Math.min(end, at + config.READ_WINDOW_BYTES - 1);
+        const window = file.createReadStream({ start: at, end: stop });
+        try {
+          for await (const chunk of window) {
+            if (res.destroyed) return;
+            written += chunk.length;
+            if (!res.write(chunk)) await once(res, 'drain');
+          }
+        } finally {
+          window.destroy();
+        }
+        at = stop + 1;
+      }
+      res.end();
     } catch (err) {
-      // A client that closes the tab mid-chunk is normal, not a fault.
-      if (err.code !== 'ERR_STREAM_PREMATURE_CLOSE') {
-        logger.warn({ err: err.message, infoHash, file: file.name }, 'stream error');
+      // A client closing the tab mid-download is normal, not a fault.
+      if (!res.destroyed) {
+        logger.warn({ err: err.message, infoHash, file: file.name, written }, 'stream error');
+        res.destroy();
       }
     } finally {
       release(written);
     }
 
     /* A short body on a response we ended ourselves means the store had forgotten a piece the
-     * bitfield still claims — a seek behind the window, or a second pass over a file the
-     * window has moved past. webtorrent never re-requests a piece it believes it has, so the
-     * only cure is to start the torrent over; the client's retry then succeeds. A client
-     * abort looks different: the socket dies before we end, so writableEnded stays false. */
+     * bitfield still claims. webtorrent never re-requests a piece it believes it has, so the
+     * only cure is to start the torrent over; Chrome then resumes with Range and it works. */
     if (written < expected && res.writableEnded) {
-      logger.warn({ infoHash, file: file.name, written, expected }, 'short read — window passed');
+      logger.warn({ infoHash, file: file.name, written, expected }, 'short read — resetting');
       engine.reset(infoHash).catch((err) => logger.warn({ err: err.message }, 'reset failed'));
     }
   });

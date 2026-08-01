@@ -57,51 +57,59 @@ Rejected as a rot risk.
 ### 1. The server is a bounded byte pump
 
 ```
-Browser (Chrome/Edge)                     flai-api (Render free, 512 MB)
+Browser                                   flai-api (Render free, 512 MB)
 ┌───────────────────────────┐            ┌─────────────────────────────────┐
-│ download-manager          │  Range     │ stream route                    │
-│  • queue (IndexedDB)      │ ─8 MB──►   │  • clamps every Range to 16 MB  │
-│  • sequential chunks      │  chunks    │  • 409s instead of dying        │
-│  • retry with backoff     │ ◄──────    │                                 │
-│  • writes to your SSD     │            │ SlidingWindowStore (RAM, 64 MB) │
-│                           │            │  LRU. drops the rest. no disk.  │
-│ progress / peers   ◄──────┼── SSE ─────┤                                 │
-└───────────────────────────┘            │ webtorrent: added with          │
-                                         │ deselect: true — only an open   │
-                                         │ stream ever selects pieces      │
+│ <a href="…&m=<magnet>"    │  one       │ stream route                    │
+│    download>Save</a>      │ ─request─► │  reads the file as a sequence   │
+│                           │            │  of 16 MB windows, writes them  │
+│ Chrome's download manager │ ◄─one──────│  into one full-length response  │
+│  progress, pause, resume  │  response  │                                 │
+│  (Range: bytes=N-)        │            │ SlidingWindowStore (RAM, 32 MB) │
+└───────────────────────────┘            │  LRU. drops the rest. no disk.  │
                                          └─────────────────────────────────┘
 ```
 
-The **clamp** is the bound. Reading webtorrent's source during implementation changed this
-part of the design for the better: `FileIterator` already takes a stream selection over exactly
-the pieces a `createReadStream` covers and drops it when the stream closes. So adding torrents
-with `deselect: true` and clamping the response is sufficient — the engine cannot want more
-than one slice of pieces at a time, and the planned `selection.js` (head-pointer arithmetic,
-manual select/deselect calls) was deleted before it was written. The store budget is the safety
-net, not the mechanism.
+The **read window** is the bound, and it is invisible from outside. webtorrent's
+`FileIterator` selects exactly the pieces one `createReadStream` covers and drops the selection
+when it closes; torrents are added with `deselect: true` so nothing else ever selects anything.
+Reading a file as a sequence of 16 MB windows therefore caps what the engine can want,
+regardless of file size or what the client asked for. Backpressure closes the loop: a slow
+client blocks the write and the swarm is never asked to run ahead.
 
-### 2. The server holds no state
+**This replaced two earlier designs, and the history is the useful part.**
 
-| State | Lives in |
-|---|---|
-| magnet + metadata | browser IndexedDB |
-| which chunks are done | browser IndexedDB |
-| where the file is saved | `FileSystemFileHandle` in IndexedDB |
-| the password | `sessionStorage` |
-| the server | nothing |
+*Attempt 1* clamped every response to 16 MB and refused un-ranged requests with 416. It bounded
+memory correctly and put the bound in the protocol, where it did not belong — a plain
+`<a download>` could no longer work.
 
-The server therefore *cannot* re-add a dropped torrent — it has no magnet. That is the
-contract, not a gap:
+*Attempt 2* therefore taught the browser to stitch slices back together in a service worker.
+It tested green against a fake bridge and did not work in the browser. Two designs deep into
+solving a problem the route could solve by itself.
+
+*Attempt 3* moved the loop into the route. Responses became ordinary, the client became a link,
+and the service worker, the download manager, the IndexedDB job store and three tabs of UI all
+got deleted.
+
+### 2. The server holds no state, and the URL carries what it needs
+
+Nothing is stored server-side: no database, no disk, no magnets, no progress. A spin-down or a
+redeploy loses nothing because there was nothing to lose. That deletes MongoDB, `db.js`, and
+the Atlas 60-day idle-pause chore.
+
+Which leaves the obvious question — if the service forgets a torrent, how does it get it back?
+**The download URL carries its own magnet:**
 
 ```
-client → GET /torrent/<hash>/0   Range: bytes=0-8388607
-server → 409 { code: "not_active" }
-client → POST /metadata { url: <magnet from IndexedDB> }     (silent)
-client → GET /torrent/<hash>/0   Range: bytes=0-8388607      (resumes)
+GET /torrent/<hash>/5?dl=1&t=<token>&m=magnet:?xt=urn:btih:<hash>&…
 ```
 
-A cold start becomes a ~20 s stall in a progress bar. Nothing to back up, migrate, or unpause.
-This is what deletes MongoDB, `db.js`, and the Atlas 60-day idle-pause chore.
+The route re-adds from `m` when the torrent is not resident. Combined with `Accept-Ranges` and
+a stable `ETag`, that means Chrome's own download manager — which retries an interrupted
+download with `Range: bytes=N-` — resumes **across a server restart with no client-side code**.
+
+Verified end to end: a server with no prior knowledge of the torrent, given only this URL,
+served all 129,241,752 bytes of a 129 MB file, with 731 window evictions and a peak RSS of
+204 MB.
 
 ### 3. Units
 
@@ -123,23 +131,10 @@ This is what deletes MongoDB, `db.js`, and the Atlas 60-day idle-pause chore.
 as `Authorization: Bearer` or `?t=`, because `<video src>` cannot set headers. This closes a
 real hole: v3's stream URLs were entirely unauthenticated against a 100 GB/month cap.
 
-**Client `public/sw.js`** — the actual downloader, revised after the first implementation.
-
-The original design used the File System Access API: `showDirectoryPicker()` once, then
-`showSaveFilePicker()` and `requestPermission()` per resume, with the queue in IndexedDB. It
-worked, but it cost a folder picker, a permission prompt, a three-tab UI to manage the queue,
-and it had a real defect — `requestPermission()` needs transient user activation, and the call
-sat several promise ticks behind the click that triggered it.
-
-Replaced with a service worker answering one invented URL with a `ReadableStream`. The worker
-loops 8 MB `Range` slices behind that stream, so Chrome sees a single native download with the
-correct `Content-Length`, lands it in Downloads with no prompt, and draws its own progress bar.
-Server restarts, cold starts and dropped connections are handled inside the stream and never
-reach the browser.
-
-What it gives up: resume after the tab closes, because a native download cannot be restarted at
-an offset. Everything that actually goes wrong in practice is invisible; the one unrecoverable
-case is the one the user controls.
+**Client** — a link. `<a href="…?dl=1&t=…&m=…" download>Save</a>`, and the browser's own
+download manager does progress, pause and resume. flai contributes no JavaScript to the
+transfer. `main.tsx` unregisters any service worker it finds, because deploying a build without
+one does not remove a worker a browser already installed.
 
 **Client `probe.ts`** — fetches the first 512 KB, sniffs the container (MP4 `ftyp`/`moov`,
 Matroska EBML `CodecID`), and asks `MediaSource.isTypeSupported`. When Chrome cannot decode
@@ -154,13 +149,14 @@ over Range. No server CPU, no WASM.
 | `maxConns` | 80 | 30 | per-connection buffers |
 | `storeCacheSlots` | 20 (default) | 0 | our store *is* the cache |
 | idle eviction | 15 min | 5 min | give RAM back sooner |
-| window budget | — | 64 MB | 4× the response clamp |
-| Range response | unbounded | clamped to 16 MB | no client can defeat the window |
+| store budget | — | 32 MB | 2× the read window; a cache fills whatever it is given |
+| read window | whole file | 16 MB | inside the route, invisible to clients |
 | keep-warm | every 10 min | **off** | it burned 730 of 750 free hours |
 
-Measured after implementation, which is why these numbers are lower than the first estimate:
-idle RSS is ~115 MB, and one active torrent serving 38 MB of a 129 MB file sat at 145 MB with
-16.9 MB resident in its window. Two torrents land near 403 MB of 512 MB.
+Measured, not estimated. Idle RSS is ~115 MB locally and 91 MB on Render's Linux. A complete
+129 MB download peaked at 233 MB with a 64 MB store budget and 204 MB with 32 MB — which is why
+the budget is 32 MB. The store is a cache: it fills whatever it is given, and only the current
+window plus slack is ever needed.
 
 ### 5. Deliberate limits
 
@@ -170,8 +166,9 @@ idle RSS is ~115 MB, and one active torrent serving 38 MB of a 129 MB file sat a
 - **The zip route is removed.** `archiver` opens read streams for every file up front, which
   selects every piece at once and defeats the window bound. Per-file download has resume and
   per-file progress, which the zip never had.
-- **The tab must stay open** for bytes to flow. It may be minimised or backgrounded. Closing it
-  ends the download for good — see the `public/sw.js` note above.
+- **Cancelling in Chrome cancels it.** There is no queue in the page to resume from. Everything
+  short of that — server restart, spin-down, dropped connection — is handled by the
+  self-healing URL plus Chrome's own Range-based retry.
 - **HMAC tokens limit exposure, they are not a bandwidth cap.** A real monthly byte counter
   needs storage, and this design deletes storage. `/healthz` reports bytes served since boot.
 
@@ -199,8 +196,8 @@ Express 5 forwards async errors itself, so every route loses its `try/catch/next
 - `SlidingWindowStore`: evicts over budget; **reading a piece protects it from eviction**;
   `get` on an evicted piece errors rather than returning empty bytes; overwriting does not
   double-count; the 4-piece floor holds; a closed store refuses writes.
-- `range.js`: `bytes=0-`, suffix ranges, inverted and past-EOF ranges, and the clamp — including
-  that a missing `Range` on a large file is refused rather than silently truncated.
+- `range.js`: `bytes=0-`, suffix ranges, inverted and past-EOF ranges, and that nothing is
+  truncated — a resume range runs to EOF, and no `Range` means the whole file at any size.
 - `token.js`: sign/verify round trip, expiry, tamper rejection, wrong-key rejection.
 - `magnet.js`: 40-hex, 32-base32, and the truncation bug that v3 fixed (kept as a guard).
 

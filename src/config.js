@@ -27,15 +27,22 @@ const Schema = z.object({
    * Two torrents is the honest ceiling. v3 shipped a default of 8, with no window at all,
    * and OOM'd.
    *
-   * MAX_CHUNK_BYTES is the real bound, not the store. webtorrent's FileIterator takes a
+   * READ_WINDOW_BYTES is the real bound, not the store. webtorrent's FileIterator takes a
    * stream selection over exactly the pieces a createReadStream covers and drops it when the
-   * stream closes, so clamping every Range response means the engine can never want more
-   * than one chunk of pieces at a time. The store budget is 4x the chunk: headroom for
-   * pieces still arriving for the previous chunk, not the mechanism. At 16 MB a 4.6 GB file
-   * is ~290 requests, which is nothing. */
+   * stream closes, so reading a file as a sequence of 16 MB windows means the engine can never
+   * want more than 16 MB of pieces at a time — however large the file, and whatever the client
+   * asked for. The store budget is 4x the window: headroom for pieces still arriving for the
+   * previous window, not the mechanism.
+   *
+   * This is invisible from outside. Responses are ordinary and full-length, so a plain
+   * <a download> works and Chrome's download manager can resume with Range. */
   MAX_ACTIVE_TORRENTS: z.coerce.number().int().positive().default(2),
-  MAX_CHUNK_BYTES: z.coerce.number().int().positive().default(16 * MB),
-  WINDOW_BUDGET_BYTES: z.coerce.number().int().positive().default(64 * MB),
+  READ_WINDOW_BYTES: z.coerce.number().int().positive().default(16 * MB),
+  /* 2x the read window, not 4x. The store is a cache, so it fills to whatever budget it is
+   * given: measured over a full 129 MB download, a 64 MB budget sat at 67 MB resident and
+   * peaked at 233 MB RSS, which is too much of a 512 MB box to spend twice. Only the current
+   * window plus slack for pieces still arriving is ever needed. */
+  WINDOW_BUDGET_BYTES: z.coerce.number().int().positive().default(32 * MB),
 
   MAX_CONNS: z.coerce.number().int().positive().default(30),
   METADATA_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),

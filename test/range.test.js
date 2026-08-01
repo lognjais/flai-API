@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import { parseRange, resolveRange } from '../src/lib/range.js';
 
 const TOTAL = 1000;
-const MAX = 100;
 
 test('parses an explicit range', () => {
   assert.deepEqual(parseRange('bytes=0-99', TOTAL), { start: 0, end: 99 });
@@ -35,32 +34,29 @@ test('unsatisfiable and malformed ranges are refused', () => {
   assert.equal(parseRange(undefined, TOTAL), null);
 });
 
-/* The clamp is the memory bound, so these are the cases that matter most. */
-test('every response is capped at maxChunk', () => {
-  assert.deepEqual(resolveRange('bytes=0-', TOTAL, MAX), { status: 206, start: 0, end: 99 });
-  assert.deepEqual(resolveRange('bytes=0-999', TOTAL, MAX), { status: 206, start: 0, end: 99 });
-  assert.deepEqual(resolveRange('bytes=500-999', TOTAL, MAX), { status: 206, start: 500, end: 599 });
+/* v4.0 clamped every response to 16 MB and refused un-ranged requests, so a plain browser
+ * download could not work. The bound moved inside routes/stream.js, which reads the file in
+ * windows and writes them into one long response. So these now assert the opposite: nothing is
+ * truncated, and a request with no Range gets the whole file. */
+test('a range is honoured exactly as asked, never truncated', () => {
+  assert.deepEqual(resolveRange('bytes=0-', TOTAL), { status: 206, start: 0, end: 999 });
+  assert.deepEqual(resolveRange('bytes=0-999', TOTAL), { status: 206, start: 0, end: 999 });
+  assert.deepEqual(resolveRange('bytes=500-999', TOTAL), { status: 206, start: 500, end: 999 });
+  assert.deepEqual(resolveRange('bytes=10-19', TOTAL), { status: 206, start: 10, end: 19 });
 });
 
-test('a range smaller than the cap is served whole', () => {
-  assert.deepEqual(resolveRange('bytes=10-19', TOTAL, MAX), { status: 206, start: 10, end: 19 });
+/* Chrome's download manager resumes an interrupted download with `bytes=N-`. Truncating that
+ * would restart the transfer from the wrong offset and corrupt the file. */
+test('a resume range runs to the end of the file', () => {
+  assert.deepEqual(resolveRange('bytes=950-', TOTAL), { status: 206, start: 950, end: 999 });
 });
 
-test('the final short chunk is not padded past EOF', () => {
-  assert.deepEqual(resolveRange('bytes=950-', TOTAL, MAX), { status: 206, start: 950, end: 999 });
+test('no Range header means the whole file, whatever its size', () => {
+  assert.deepEqual(resolveRange(undefined, 50), { status: 200, start: 0, end: 49 });
+  assert.deepEqual(resolveRange(undefined, 5_000_000_000), { status: 200, start: 0, end: 4_999_999_999 });
 });
 
-test('no Range header on a small file is a normal 200', () => {
-  assert.deepEqual(resolveRange(undefined, 50, MAX), { status: 200, start: 0, end: 49 });
-});
-
-test('no Range header on a big file is refused, not silently truncated', () => {
-  // Serving fewer bytes than Content-Length would corrupt every client, and lying about
-  // Content-Length is worse. 416 with a reason is the only honest answer.
-  assert.equal(resolveRange(undefined, TOTAL, MAX).status, 416);
-});
-
-test('a malformed Range is refused rather than treated as the whole file', () => {
-  assert.equal(resolveRange('bytes=zzz', TOTAL, MAX).status, 416);
-  assert.equal(resolveRange('bytes=2000-3000', TOTAL, MAX).status, 416);
+test('an unsatisfiable Range is refused rather than silently served', () => {
+  assert.equal(resolveRange('bytes=zzz', TOTAL).status, 416);
+  assert.equal(resolveRange('bytes=2000-3000', TOTAL).status, 416);
 });

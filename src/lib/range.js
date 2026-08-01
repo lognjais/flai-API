@@ -1,16 +1,10 @@
-/* HTTP Range parsing, and the clamp that makes the memory bound real.
+/* HTTP Range parsing. Ordinary, on purpose.
  *
- * Clamping matters more than parsing. webtorrent's FileIterator selects every piece a
- * createReadStream covers, so a request for the whole file selects the whole file and the
- * sliding window stops being a window. Every response is therefore capped at
- * MAX_CHUNK_BYTES, which a server is allowed to do: RFC 9110 lets a 206 carry fewer bytes
- * than the client asked for.
- *
- * The one case with no honest answer is a request with no Range header at all for a file
- * bigger than the cap — that asks for the whole thing, and lying about Content-Length to
- * serve less would break every client. So it is refused with 416 and a reason. Both real
- * clients always send Range: our download manager by construction, and <video> because
- * Chrome opens media with `bytes=0-`.
+ * v4.0 clamped every response to 16 MB and refused un-ranged requests with 416, so a plain
+ * <a download> could not work and the browser had to be taught to stitch slices together. That
+ * was the wrong place to solve it: the memory bound belongs inside the route, not in the
+ * protocol. routes/stream.js now reads the file in bounded windows and writes them into one
+ * long response, so this file can go back to doing what a Range parser should.
  */
 
 const RANGE_RE = /^bytes=(\d*)-(\d*)$/;
@@ -43,16 +37,15 @@ export function parseRange(header, totalSize) {
 }
 
 /**
- * @returns {{status:206|200|416, start:number, end:number}}
- *   416 carries no body; the caller turns it into the error envelope.
+ * No Range header means the whole file, which is what a browser download and a plain curl both
+ * send. A Range is honoured exactly as asked — Chrome's download manager uses `bytes=N-` to
+ * resume an interrupted download, and truncating that would break the resume.
+ *
+ * @returns {{status:200|206|416, start:number, end:number}}
  */
-export function resolveRange(header, totalSize, maxChunk) {
-  if (!header) {
-    if (totalSize <= maxChunk) return { status: 200, start: 0, end: Math.max(0, totalSize - 1) };
-    return { status: 416, start: 0, end: 0 };
-  }
+export function resolveRange(header, totalSize) {
+  if (!header) return { status: 200, start: 0, end: Math.max(0, totalSize - 1) };
   const range = parseRange(header, totalSize);
   if (!range) return { status: 416, start: 0, end: 0 };
-  const end = Math.min(range.end, range.start + maxChunk - 1);
-  return { status: 206, start: range.start, end };
+  return { status: 206, start: range.start, end: range.end };
 }

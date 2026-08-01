@@ -62,7 +62,13 @@ export class TorrentEngine {
     const inflight = this.#pending.get(infoHash);
     if (inflight) return inflight;
 
-    if (this.#torrents.size >= config.MAX_ACTIVE_TORRENTS) this.#evictOne();
+    if (this.#torrents.size >= config.MAX_ACTIVE_TORRENTS && !this.#evictOne()) {
+      const err = new Error(
+        `all ${config.MAX_ACTIVE_TORRENTS} slots are busy downloading — try again when one finishes`
+      );
+      err.code = 'at_capacity';
+      throw err;
+    }
 
     const promise = this.#add(uri, infoHash);
     this.#pending.set(infoHash, promise);
@@ -80,8 +86,9 @@ export class TorrentEngine {
           /* The bound. With deselect the torrent starts wanting nothing, and the only thing
            * that ever selects pieces is webtorrent's own FileIterator, which selects exactly
            * the range a createReadStream covers and drops the selection when the stream
-           * closes. Because the route clamps every Range to MAX_CHUNK_BYTES, the engine can
-           * never want more than one chunk of pieces at a time. */
+           * closes. Because routes/stream.js reads a file as a sequence of READ_WINDOW_BYTES
+           * windows, the engine can never want more than one window of pieces at a time —
+           * whatever the client asked for. */
           deselect: true,
           store: SlidingWindowStore,
           storeOpts: { budgetBytes: config.WINDOW_BUDGET_BYTES },
@@ -176,13 +183,19 @@ export class TorrentEngine {
     }
   }
 
+  /** @returns {boolean} whether a slot was actually freed. */
   #evictOne() {
-    if (this.#torrents.size === 0) return;
+    if (this.#torrents.size === 0) return true;
     const byAge = [...this.#torrents.keys()].sort(
       (a, b) => (this.#lastTouched.get(a) ?? 0) - (this.#lastTouched.get(b) ?? 0)
     );
-    const victim = byAge.find((h) => (this.#streams.get(h) ?? 0) === 0) ?? byAge[0];
+    /* Never a torrent that is being read. The old code fell back to the oldest torrent when
+     * every slot was busy, which meant adding a third magnet silently killed somebody's
+     * in-progress download. Refusing the new one is the honest failure. */
+    const victim = byAge.find((h) => this.streamCount(h) === 0);
+    if (!victim) return false;
     this.#remove(victim, 'capacity');
+    return true;
   }
 
   #remove(infoHash, reason) {

@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { parseMagnet, contentTypeFor, isStreamable } from '../lib/magnet.js';
-import { badRequest, timeout, upstream } from '../lib/errors.js';
+import { badRequest, conflict, timeout, upstream } from '../lib/errors.js';
 
 const Body = z.object({ url: z.string().min(20).max(8192) });
 
@@ -22,6 +22,9 @@ export function metadataRouter(engine) {
     try {
       torrent = await engine.addOrGet(magnet);
     } catch (err) {
+      // Both slots are being read and nothing is safe to evict. A 502 would suggest the swarm
+      // failed, when the honest answer is that this box only holds two torrents.
+      if (err.code === 'at_capacity') throw conflict(err.message, 'at_capacity');
       if (/timed out/i.test(err.message)) throw timeout('peers were slow to respond — try again');
       throw upstream(`could not fetch torrent metadata: ${err.message}`);
     }

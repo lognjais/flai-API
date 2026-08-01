@@ -1,12 +1,11 @@
 # flai-api
 
-A torrent-to-HTTP bridge that **forgets**. Paste a magnet, get bounded `Range` slices over
-HTTP — enough for a browser to download a 50 GB file, on a box with 512 MB of RAM and no disk
-at all.
+A torrent-to-HTTP bridge that **forgets**. Paste a magnet, get an ordinary HTTP download —
+of a 50 GB file, from a box with 512 MB of RAM and no disk at all.
 
 ```
 flai/ (browser, GH Pages)  ──►  flai-api (Render free)  ──►  BitTorrent swarm
-   the download manager           a bounded byte pump
+    one <a download>              reads in 16 MB windows
 ```
 
 ## The one idea
@@ -22,13 +21,20 @@ Nothing touches disk.
 
 Forgetting is safe because of two things that reinforce each other:
 
-1. **Every response is clamped to `MAX_CHUNK_BYTES`.** webtorrent's `FileIterator` takes a
-   stream selection over exactly the pieces a `createReadStream` covers and drops it when the
-   stream closes. Torrents are added with `deselect: true`, so nothing else ever selects
-   anything. Clamp the response and the engine *cannot* want more than one slice of pieces at
-   a time. The clamp is the bound; the store budget is the safety net.
+1. **The route reads in windows.** `routes/stream.js` serves one ordinary full-length response,
+   but internally reads it as a sequence of 16 MB `createReadStream` calls. webtorrent's
+   `FileIterator` takes a stream selection over exactly the pieces a read covers and drops it
+   when that read closes, and torrents are added with `deselect: true` so nothing else ever
+   selects anything. The engine therefore cannot want more than 16 MB of pieces at a time —
+   however large the file, and whatever the client asked for. Backpressure finishes the job: a
+   slow client blocks the write and the swarm is never asked to run ahead.
 2. **`get` touches a piece**, so whatever the current reader is reading is the most recently
-   used and cannot be evicted by pieces arriving for its own slice.
+   used and cannot be evicted by pieces arriving for its own window.
+
+**This is invisible from outside.** v4.0 clamped every response to 16 MB and refused un-ranged
+requests with 416, which meant a plain `<a download>` could not work and the browser needed a
+service worker to stitch the slices back together. That put the memory bound in the protocol
+where it did not belong. Responses are ordinary now.
 
 When forgetting does bite — a seek backwards past the window — the read comes up short, the
 route notices, resets the torrent to clear its bitfield, and the client retries. Slow,
@@ -36,25 +42,23 @@ correct, self-healing.
 
 ## The other idea: no state
 
-| State | Lives in |
-|---|---|
-| magnet + metadata | the browser's IndexedDB |
-| which bytes are done | the browser's IndexedDB |
-| where the file is saved | a `FileSystemFileHandle` in IndexedDB |
-| **this service** | **nothing** |
+Nothing is stored here. No database, no disk, no magnets, no progress — a spin-down or a
+redeploy loses nothing because there was nothing to lose. v3's MongoDB and its Atlas
+60-day idle-pause chore are gone.
 
-So this service cannot resurrect a torrent it dropped — it never had the magnet. That is the
-contract, not a gap:
+Which raises the obvious problem: if the service forgets a torrent, how does it ever get it
+back? **The download URL carries its own magnet.**
 
 ```
-client → GET /torrent/<hash>/0   Range: bytes=0-8388607
-       ← 409 { code: "not_active" }
-client → POST /metadata { url: <magnet it already had> }     (silent)
-client → GET /torrent/<hash>/0   Range: bytes=0-8388607      (resumes)
+GET /torrent/<hash>/5?dl=1&t=<token>&m=magnet:?xt=urn:btih:<hash>&…
 ```
 
-A spin-down costs one silent round trip. There is no database to back up, migrate, or unpause
-— v3's MongoDB and its Atlas 60-day idle-pause chore are gone.
+So the link is self-healing. If the box spun down, restarted or evicted the torrent for
+capacity, the route re-adds it from the `m` parameter and carries on. Chrome's download manager
+retries an interrupted download with `Range: bytes=N-` all by itself, which means **a native
+download survives a server restart with no client-side code at all** — no service worker, no
+retry loop, no JavaScript. That is the whole reason `Accept-Ranges` and a stable `ETag` are set
+on every response.
 
 ## API
 
@@ -64,7 +68,7 @@ Everything except `/healthz` needs a token. `POST /session` trades the password 
 |---|---|---|
 | `POST` | `/session` | `{ password }` → `{ token, expiresAt }`. HMAC-SHA256 over the expiry, keyed by `PASS`. 12 h. |
 | `POST` | `/metadata` | `{ url: <magnet> }` → `{ infoHash, name, size, pieceLength, files[] }` |
-| `GET` | `/torrent/:infoHash/:fileIndex` | The bytes. **`Range` required** above `MAX_CHUNK_BYTES`; every response is clamped to it. `?dl=1` for an attachment. |
+| `GET` | `/torrent/:infoHash/:fileIndex` | The bytes, whole file or `Range`, nothing truncated. `?dl=1` for an attachment, `?m=<magnet>` to make the URL self-healing. |
 | `GET` | `/stats/:infoHash` | SSE at 1 Hz: peers, speed, whether the torrent is still resident. |
 | `GET` | `/healthz` | Unauthenticated. Counts, speeds, RSS, and each window's own bookkeeping. |
 
@@ -79,7 +83,8 @@ Errors are always `{ error: { code, message } }`. The codes the client branches 
 |---|---|---|
 | `not_active` | 409 | re-`POST /metadata` and retry — expected, not a failure |
 | `busy` | 409 | another reader holds this torrent's single window |
-| `range_required` | 416 | send a `Range`; this bridge never serves whole files |
+| `range_not_satisfiable` | 416 | the range starts past the end of the file |
+| `at_capacity` | 409 | both slots are busy being read; nothing safe to evict |
 
 ## Quick start
 
@@ -97,9 +102,8 @@ TOK=$(curl -s localhost:5000/session -X POST -H 'content-type: application/json'
 curl -s localhost:5000/metadata -X POST -H "authorization: Bearer $TOK" \
   -H 'content-type: application/json' -d '{"url":"magnet:?xt=urn:btih:..."}'
 
-# Range is not optional above 16 MB.
-curl -s -H "authorization: Bearer $TOK" -H 'Range: bytes=0-8388607' \
-  localhost:5000/torrent/<infoHash>/0 -o slice.bin
+# The whole file, one request, bounded memory on the server side.
+curl -s -H "authorization: Bearer $TOK" localhost:5000/torrent/<infoHash>/0 -o file.bin
 ```
 
 ## Deploy
@@ -116,11 +120,11 @@ Numbers measured on 2026-08-01, not estimated:
 
 | | |
 |---|---|
-| Idle RSS | ~115 MB |
-| Per active torrent | ~80 MB of peer buffers + its window |
-| Default window | 64 MB |
-| **Two torrents** | **~403 MB of 512 MB** |
-| After serving 38 MB of a 129 MB file | RSS 145 MB, window holding 16.9 MB |
+| Idle RSS | ~115 MB (91 MB on Render's Linux) |
+| Read window | 16 MB |
+| Store budget | 32 MB |
+| A full 129 MB download | completed byte-exact, **475 window evictions** |
+| Peak RSS during it, 64 MB budget | 233 MB — which is why the budget is now 32 MB |
 
 Other limits worth knowing:
 
@@ -180,7 +184,7 @@ Design notes:
 | | v3 | v4 |
 |---|---|---|
 | Chunk store | webtorrent default, unbounded | 64 MB LRU window, no disk |
-| Range responses | unbounded | clamped to 16 MB, `Range` required above that |
+| Reads | one stream over the whole file | 16 MB windows inside one full-length response |
 | Piece selection | whole torrent, low priority | `deselect: true`; only an open stream selects |
 | Max torrents | 8 | 2 |
 | `maxConns` | 80 | 30 |

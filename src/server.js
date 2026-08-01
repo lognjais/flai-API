@@ -14,6 +14,7 @@ import { requireToken } from './lib/token.js';
 import { sessionRouter } from './routes/session.js';
 import { metadataRouter } from './routes/metadata.js';
 import { streamRouter } from './routes/stream.js';
+import { archiveRouter } from './routes/archive.js';
 import { statsRouter } from './routes/stats.js';
 import { healthRouter } from './routes/health.js';
 
@@ -79,6 +80,7 @@ async function bootstrap() {
         'POST /session',
         'POST /metadata',
         'GET /torrent/:hash/:idx',
+        'GET /torrent/:hash (zip)',
         'GET /stats/:hash',
         'GET /healthz',
       ],
@@ -88,7 +90,9 @@ async function bootstrap() {
   app.use('/healthz', healthRouter(engine, startedAt));
   app.use('/session', authLimiter, sessionRouter());
   app.use('/metadata', writeLimiter, requireToken, metadataRouter(engine));
-  app.use('/torrent', requireToken, streamRouter(engine));
+  /* Both mount at /torrent: the archive router answers /:infoHash, the stream router answers
+   * /:infoHash/:fileKey. Distinct paths, so the order between them does not matter. */
+  app.use('/torrent', requireToken, streamRouter(engine), archiveRouter(engine));
   app.use('/stats', requireToken, statsRouter(engine));
 
   app.use((req, res) => {

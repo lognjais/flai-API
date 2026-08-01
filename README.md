@@ -69,6 +69,7 @@ Everything except `/healthz` needs a token. `POST /session` trades the password 
 | `POST` | `/session` | `{ password }` → `{ token, expiresAt }`. HMAC-SHA256 over the expiry, keyed by `PASS`. 12 h. |
 | `POST` | `/metadata` | `{ url: <magnet> }` → `{ infoHash, name, size, pieceLength, files[] }` |
 | `GET` | `/torrent/:infoHash/:fileIndex` | The bytes, whole file or `Range`, nothing truncated. `?dl=1` for an attachment, `?m=<magnet>` to make the URL self-healing. |
+| `GET` | `/torrent/:infoHash` | Every file as one streamed zip. Same `?dl=1` and `?m=` . No `Content-Length` and no resume — see below. |
 | `GET` | `/stats/:infoHash` | SSE at 1 Hz: peers, speed, whether the torrent is still resident. |
 | `GET` | `/healthz` | Unauthenticated. Counts, speeds, RSS, and each window's own bookkeeping. |
 
@@ -129,7 +130,12 @@ Numbers measured on 2026-08-01, not estimated:
 Other limits worth knowing:
 
 - **One reader per torrent.** Two readers at different offsets would evict each other's pieces
-  and both would crawl. A second distant reader gets `409 busy`.
+  and both would crawl. A second distant reader gets `409 busy`. The zip counts as that one
+  reader, so it costs no more memory than saving a single file does.
+- **The zip has no `Content-Length` and cannot be resumed.** It is generated as it is sent, so
+  its size is not known when the headers go out. Chrome shows an unknown size and, if the
+  transfer breaks, starts over. Single files keep both. That is the price of one action instead
+  of thirty, and the UI says so.
 - **No inbound peer connections.** Render exposes one HTTP port, so peers are outbound-only
   plus DHT. A swarm with only unconnectable peers will not work.
 - **The free tier sleeps** after 15 idle minutes and takes ~1 minute to wake. There is
@@ -167,11 +173,13 @@ src/
 │   ├── session.js         POST /session
 │   ├── metadata.js        POST /metadata
 │   ├── stream.js          GET /torrent/:hash/:idx           ← and this one
+│   ├── archive.js         GET /torrent/:hash — every file as one zip
 │   ├── stats.js           GET /stats/:hash (SSE)
 │   └── health.js          GET /healthz
 └── lib/
     ├── magnet.js          parseMagnet (40-hex + 32-base32), MIME table
-    ├── range.js           parseRange + the clamp
+    ├── range.js           parseRange
+    ├── windowed.js        the bounded read both routes share
     ├── token.js           HMAC sign / verify, password check
     └── errors.js          HttpError + helpers
 ```
@@ -185,6 +193,7 @@ Design notes:
 |---|---|---|
 | Chunk store | webtorrent default, unbounded | 64 MB LRU window, no disk |
 | Reads | one stream over the whole file | 16 MB windows inside one full-length response |
+| Zip route | `archiver` over every file at once | lazy windowed generators, one file in flight |
 | Piece selection | whole torrent, low priority | `deselect: true`; only an open stream selects |
 | Max torrents | 8 | 2 |
 | `maxConns` | 80 | 30 |

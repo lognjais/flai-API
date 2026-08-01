@@ -4,6 +4,7 @@ import { config } from '../config.js';
 import { logger } from '../logger.js';
 import { contentTypeFor, parseMagnet } from '../lib/magnet.js';
 import { resolveRange } from '../lib/range.js';
+import { windows } from '../lib/windowed.js';
 import { badRequest, conflict, notFound, rangeNotSatisfiable } from '../lib/errors.js';
 
 const HEX40 = /^[a-f0-9]{40}$/i;
@@ -94,23 +95,13 @@ export function streamRouter(engine) {
 
     let written = 0;
     try {
-      /* The bound. Each createReadStream makes webtorrent select exactly the pieces it covers
-       * and drop the selection when it closes, so the engine never wants more than one window
-       * at a time however large the file is. Backpressure does the rest: if the client reads
-       * slowly, res.write() blocks here and the swarm is never asked to run ahead. */
-      for (let at = start; at <= end; ) {
-        const stop = Math.min(end, at + config.READ_WINDOW_BYTES - 1);
-        const window = file.createReadStream({ start: at, end: stop });
-        try {
-          for await (const chunk of window) {
-            if (res.destroyed) return;
-            written += chunk.length;
-            if (!res.write(chunk)) await once(res, 'drain');
-          }
-        } finally {
-          window.destroy();
-        }
-        at = stop + 1;
+      /* The bound, shared with the zip route — see lib/windowed.js. Backpressure does the rest:
+       * if the client reads slowly, res.write() blocks here and the swarm is never asked to run
+       * ahead of what is actually being consumed. */
+      for await (const chunk of windows(file, config.READ_WINDOW_BYTES, start, end)) {
+        if (res.destroyed) return;
+        written += chunk.length;
+        if (!res.write(chunk)) await once(res, 'drain');
       }
       res.end();
     } catch (err) {

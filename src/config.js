@@ -44,7 +44,26 @@ const Schema = z.object({
    * window plus slack for pieces still arriving is ever needed. */
   WINDOW_BUDGET_BYTES: z.coerce.number().int().positive().default(32 * MB),
 
-  MAX_CONNS: z.coerce.number().int().positive().default(30),
+  /* Peers per torrent, and the one number here that is about speed rather than safety.
+   *
+   * This was 30, lowered from v3's 80 to protect the box — below webtorrent's own default of
+   * 55, which was a mistake. Peer acquisition, not the read path, is what makes a download feel
+   * slow: a cold torrent spends its first minute crawling at tens of KB/s while DHT and the
+   * trackers find peers, and more connection slots find them faster.
+   *
+   * Measured on one magnet, A-B-A so a warm DHT could not take the credit:
+   *
+   *   conns  metadata  first 8 MB  peak RSS   40 MB in
+   *   30       8s         82s       177 MB      73s
+   *   100      4s         47s       192 MB      39s
+   *   30       8s         86s         —         —      (reverted, so the effect is real)
+   *   200      —           —        185 MB      45s     (no further gain; peers plateau)
+   *
+   * So 100 buys roughly half the time-to-first-bytes for about 15 MB. Two torrents streaming at
+   * once lands near 270 MB of 512 MB, which leaves room. 200 was not better — the swarm runs
+   * out of reachable peers before the slots run out, which is what you would expect on a host
+   * with no inbound connections. */
+  MAX_CONNS: z.coerce.number().int().positive().default(100),
   METADATA_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
   TORRENT_IDLE_EVICT_MS: z.coerce.number().int().positive().default(5 * 60 * 1000),
 

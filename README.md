@@ -126,6 +126,7 @@ Numbers measured on 2026-08-01, not estimated:
 | Store budget | 32 MB |
 | A full 129 MB download | completed byte-exact, **475 window evictions** |
 | Peak RSS during it, 64 MB budget | 233 MB — which is why the budget is now 32 MB |
+| Peers per torrent | 100. At 30 the same download took 1.9x as long, for 15 MB less |
 
 Other limits worth knowing:
 
@@ -137,7 +138,11 @@ Other limits worth knowing:
   transfer breaks, starts over. Single files keep both. That is the price of one action instead
   of thirty, and the UI says so.
 - **No inbound peer connections.** Render exposes one HTTP port, so peers are outbound-only
-  plus DHT. A swarm with only unconnectable peers will not work.
+  plus DHT. A swarm with only unconnectable peers will not work, and it is why raising
+  `MAX_CONNS` past ~100 buys nothing: the reachable peers run out before the slots do.
+- **A cold torrent is slow to start, and that is where the time goes.** Measured: the read path
+  peaks near 7 MB/s, but the first minute crawls at tens of KB/s while DHT and the trackers find
+  peers. Time-to-first-bytes, not throughput, is what makes a download feel slow.
 - **The free tier sleeps** after 15 idle minutes and takes ~1 minute to wake. There is
   deliberately **no keep-warm ping**: v3's cost ~730 of the 750 free instance-hours a month,
   leaving no margin for one restart. An open download generates inbound traffic, so it cannot

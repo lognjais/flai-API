@@ -1,10 +1,13 @@
 # flai-api
 
 A torrent-to-HTTP bridge that **forgets**. Paste a magnet, get an ordinary HTTP download —
-of a 50 GB file, from a box with 512 MB of RAM and no disk at all.
+of a 50 GB file, from a service capped at 320 MB of RAM that writes nothing to disk.
+
+It was built against Render's 512 MB free tier and now runs on a 1 GB box shared with three
+other services, which is why the cap matters more than the box does.
 
 ```
-flai/ (browser, GH Pages)  ──►  flai-api (Render free)  ──►  BitTorrent swarm
+flai/ (browser, GH Pages)  ──►  flai-api (a box you own)  ──►  BitTorrent swarm
     one <a download>              reads in 16 MB windows
 ```
 
@@ -108,13 +111,15 @@ curl -s -H "authorization: Bearer $TOK" localhost:5000/torrent/<infoHash>/0 -o f
 
 ## Deploy
 
-**A box you own, via the `Dockerfile`.** This is what runs now: a service on a shared Oracle
-Always Free box behind that host's nginx, as one compose block with `mem_limit` and one
-`location`. It buys a disk, no 15-minute sleep, no 100 GB egress cap, and the ability to accept
-inbound peer connections — see below for why that last one matters most.
+**A box you own, via the `Dockerfile`.** This is the only supported deployment now: a service
+behind an existing nginx, as one compose block with a `mem_limit` and one `location`. It buys a
+disk, no 15-minute sleep, no monthly egress cap, and the ability to accept inbound peer
+connections — see below for why that last one matters most.
 
-**Render free, from `render.yaml`:** Dashboard → New → Blueprint → pick this repo. Set `PASS` in
-the dashboard (it is `sync: false`, so it never lives in git). Push to deploy.
+Render is gone. `render.yaml` was deleted along with it; the free tier slept after 15 idle
+minutes, capped egress at 100 GB a month, and a keep-warm ping to avoid the sleeping cost 730
+of the 750 free hours. Measurements below that say "on Render" are kept because that is where
+they were taken, not because it is still an option.
 
 `fly.toml` is kept for self-hosting, but Fly replaced its free allowances with a 2-hour trial
 in 2024 — only pre-2024 accounts still get free machines.
@@ -178,7 +183,8 @@ Other limits worth knowing:
 - **100 GB/month of bandwidth.** Tokens limit exposure but are not a cap — a real monthly
   counter needs storage, and v4 deleted storage. `/healthz` reports bytes since boot; Render's
   dashboard is the authority.
-- **Don't run a public instance.** Render is quick to terminate accounts over DMCA.
+- **Don't run a public instance.** Hosts terminate accounts over DMCA, and on a shared box
+  that takes down everything else living on it.
 
 ## Why not rqbit
 

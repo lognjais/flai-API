@@ -108,11 +108,33 @@ curl -s -H "authorization: Bearer $TOK" localhost:5000/torrent/<infoHash>/0 -o f
 
 ## Deploy
 
-Render free, from `render.yaml`: Dashboard → New → Blueprint → pick this repo. Set `PASS` in
+**A box you own, via the `Dockerfile`.** This is what runs now: a service on a shared Oracle
+Always Free box behind that host's nginx, as one compose block with `mem_limit` and one
+`location`. It buys a disk, no 15-minute sleep, no 100 GB egress cap, and the ability to accept
+inbound peer connections — see below for why that last one matters most.
+
+**Render free, from `render.yaml`:** Dashboard → New → Blueprint → pick this repo. Set `PASS` in
 the dashboard (it is `sync: false`, so it never lives in git). Push to deploy.
 
 `fly.toml` is kept for self-hosting, but Fly replaced its free allowances with a 2-hour trial
 in 2024 — only pre-2024 accounts still get free machines.
+
+### Two things that will bite whoever containerises this next
+
+**Use a glibc base image. Not alpine.** `node:24-alpine` builds, boots and answers `/healthz`
+perfectly, then dies with `SIGSEGV` on the first `POST /metadata`. webtorrent's tree carries
+native modules — `node-datachannel` (WebRTC, via `@thaunknown/simple-peer`) and `utp-native` —
+and their prebuilds ship for `linux-x64` only, which means glibc. Loading one against musl does
+not raise a readable error; it segfaults in a background thread, so the application log ends
+mid-sentence, the container exits 139 and Docker restarts it. It reads as a mysterious clean
+restart. `docker events` is what tells you the truth.
+
+**Turn proxy buffering off.** A reverse proxy that buffers will spool a multi-gigabyte response
+to its own disk, and — worse — will drain this service at full speed no matter what the browser
+is doing. The one-reader-per-torrent handover decides a client has left by watching the
+response stop draining, so a buffering proxy makes every cancelled download look alive and
+leaves the torrent answering `busy`. In nginx that is `proxy_buffering off`,
+`proxy_request_buffering off` and `proxy_max_temp_file_size 0`.
 
 ## Operational reality
 

@@ -11,9 +11,18 @@ const Schema = z.object({
   PASS: z.string().min(1, 'PASS env var is required'),
   SESSION_TTL_HOURS: z.coerce.number().int().positive().max(168).default(12),
 
+  /* Just the one page. flai.ivehement.com was in here and has never resolved, and a stale
+   * entry in an allowlist is the kind of thing nobody removes later.
+   *
+   * Worth being clear about what this does and does not buy, because it is easy to mistake
+   * for a lock on the door. CORS is enforced by browsers, on behalf of *other* pages: it
+   * stops someone else's site calling this API with your credentials. It stops nothing else.
+   * curl sends no Origin at all, and anyone can send whatever Origin they like. The actual
+   * credential is the HMAC token, and the actual protection against being flooded is the
+   * connection and request limits in front of this process. */
   ALLOWED_ORIGINS: z
     .string()
-    .default('https://jvoltci.github.io,https://flai.ivehement.com,http://localhost:5173')
+    .default('https://jvoltci.github.io,http://localhost:5173')
     .transform((s) => s.split(',').map((o) => o.trim()).filter(Boolean)),
 
   /* ── the three numbers that keep this inside 512 MB ─────────────────────────

@@ -160,10 +160,16 @@ test('a genuinely slow client is not mistaken for a phantom', async (t) => {
   const { engine, server, stop, ready } = harness();
   await ready;
   t.after(stop);
-  config.DRAIN_GRACE_MS = 300;
+  /* 1500ms against a 50ms pump — a 30x margin, not the 6x this had first.
+   *
+   * At 300ms it passed on a laptop and failed on the 1/8 OCPU box it was about to be deployed
+   * to: a setInterval there can slip by hundreds of milliseconds, the reader looks parked, and
+   * a client that was reading perfectly well loses its window. The test was right to fail. The
+   * production value moved too — see DRAIN_GRACE_MS in config.js. */
+  config.DRAIN_GRACE_MS = 1500;
   config.DRAIN_TIMEOUT_MS = 60_000;
 
-  // Reads in bursts with gaps shorter than the grace — slow, but alive.
+  // Reads in bursts far shorter than the grace — slow, but unmistakably alive.
   const req = http.get({ port: server.address().port, path: `/torrent/${HASH}/0` });
   req.on('error', () => {});
   const [res] = await once(req, 'response');

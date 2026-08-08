@@ -1,10 +1,7 @@
 node_modules
-npm-debug.log*
+test
 .git
-.gitignore
-.env*
-!.env.example
-README.md
-.DS_Store
-.eslintcache
-coverage
+.env
+*.md
+Dockerfile
+.dockerignore

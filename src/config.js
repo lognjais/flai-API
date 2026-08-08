@@ -83,9 +83,15 @@ const Schema = z.object({
    * a new request may take the window.
    *
    * DRAIN_TIMEOUT_MS is when such a read gives up unasked, so a phantom clears itself even if
-   * nobody else ever wants the torrent. */
+   * nobody else ever wants the torrent.
+   *
+   * DRAIN_GRACE_MS was 3s, and running the suite on the 1/8 OCPU box this now deploys to showed
+   * that is too tight. A setInterval on a heavily shared vCPU can slip by hundreds of
+   * milliseconds, and every millisecond of slip looks exactly like a client that stopped
+   * reading. Getting this wrong is asymmetric: too long and a phantom hangs about a few extra
+   * seconds, too short and a download in progress gets its window taken. 8s. */
   STREAM_STALL_MS: z.coerce.number().int().positive().default(120_000),
-  DRAIN_GRACE_MS: z.coerce.number().int().positive().default(3_000),
+  DRAIN_GRACE_MS: z.coerce.number().int().positive().default(8_000),
   DRAIN_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
   TORRENT_IDLE_EVICT_MS: z.coerce.number().int().positive().default(5 * 60 * 1000),
 

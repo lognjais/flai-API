@@ -1,22 +1,30 @@
-# Node 20 reached end of life on 30 April 2026, which is what this image used to pin.
-# 24 is Active LTS until 30 April 2028.
-FROM node:24-alpine AS deps
-WORKDIR /app
-COPY package.json ./
-RUN npm install --omit=dev --no-audit --no-fund
-
+# flai-api as a container, for hosts that run several small services behind one
+# front door — see the maia host repo.
+#
+# alpine because pulls on a 1/8 OCPU Always Free box are slow and the node:24
+# Debian image is ~5x the size for nothing this needs.
 FROM node:24-alpine
+
 WORKDIR /app
-ENV NODE_ENV=production
-COPY --from=deps /app/node_modules ./node_modules
-COPY package.json ./
+
+# Dependencies first, so a source change does not re-resolve the tree.
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+
 COPY src ./src
 
-RUN addgroup -g 1001 -S app && adduser -S app -u 1001 -G app
-USER app
-
+# Node's default heap on a small box is generous enough to get OOM-killed by the
+# container limit before V8 ever decides to collect. The sliding window's bytes
+# are Buffers, which live outside the heap, so the heap itself needs very little.
+ENV NODE_OPTIONS=--max-old-space-size=192
+ENV PORT=5000
 EXPOSE 5000
-HEALTHCHECK --interval=60s --timeout=5s --retries=3 \
-  CMD wget -qO- http://127.0.0.1:5000/healthz || exit 1
+
+# Not root, and not a user that has to be created — node:alpine ships one.
+USER node
+
+# The bridge answers /healthz without touching the swarm, so this stays cheap.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:5000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 CMD ["node", "src/server.js"]

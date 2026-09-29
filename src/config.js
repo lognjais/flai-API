@@ -22,7 +22,7 @@ const Schema = z.object({
    * connection and request limits in front of this process. */
   ALLOWED_ORIGINS: z
     .string()
-    .default('https://jvoltci.github.io,http://localhost:5173')
+    .default('https://lognjais.github.io,http://localhost:5173')
     .transform((s) => s.split(',').map((o) => o.trim()).filter(Boolean)),
 
   /* ── the three numbers that keep this inside 512 MB ─────────────────────────

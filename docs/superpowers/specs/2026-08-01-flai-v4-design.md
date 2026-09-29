@@ -1,7 +1,7 @@
 # flai v4 — a downloader that fits a 512 MB box and then needs no attention
 
 Date: 2026-08-01
-Repos: [`jvoltci/flai`](https://github.com/jvoltci/flai) (browser), [`jvoltci/flai-api`](https://github.com/jvoltci/flai-api) (bridge)
+Repos: [`lognjais/flai`](https://github.com/lognjais/flai) (browser), [`jvoltci/flai-api`](https://github.com/lognjais/flai-api) (bridge)
 
 ## The problem
 

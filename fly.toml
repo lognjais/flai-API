@@ -12,7 +12,7 @@ primary_region = "iad"
 
 [env]
   NODE_ENV = "production"
-  ALLOWED_ORIGINS = "https://jvoltci.github.io,https://flai.ivehement.com"
+  ALLOWED_ORIGINS = "https://lognjais.github.io,https://flai.ivehement.com"
   LOG_LEVEL = "info"
 
 [http_service]

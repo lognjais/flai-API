@@ -74,7 +74,7 @@ async function bootstrap() {
     res.json({
       service: 'flai-api',
       version: '4.0.0',
-      docs: 'https://github.com/jvoltci/flai-api',
+      docs: 'https://github.com/lognjais/flai-api',
       routes: [
         'POST /session',
         'POST /metadata',
